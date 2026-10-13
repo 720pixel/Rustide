@@ -28,8 +28,9 @@ struct Completed {
 ///
 /// A single reader fills whole-piece batches while CPU workers hash earlier
 /// batches. `batch_bytes` is rounded down to a multiple of `piece_length`, with
-/// a minimum of one piece. At most `workers + 1` buffers of that effective size
-/// are allocated, and fewer are used for small inputs. This bounds payload
+/// a minimum of one piece, then capped at the total payload size. At most
+/// `workers + 1` buffers of that effective size are allocated, and fewer are
+/// used for small inputs. This bounds payload
 /// memory independently of input size. Digest output and temporary per-batch
 /// piece references require additional memory proportional to their counts.
 ///
@@ -44,7 +45,6 @@ pub fn hash_v1_buffered(
     ensure!(piece_length > 0, "piece length must be greater than zero");
     ensure!(workers > 0, "worker count must be greater than zero");
     let piece_bytes = u64::try_from(piece_length).context("piece length is too large")?;
-    let effective_batch = batch_bytes.max(piece_length) / piece_length * piece_length;
     let total = files.iter().try_fold(0_u64, |total, entry| {
         total
             .checked_add(entry.length)
@@ -56,6 +56,8 @@ pub fn hash_v1_buffered(
         ensure!(reader.fill(&mut [0_u8; 1])? == 0, "unexpected input bytes");
         return Ok(Vec::new());
     }
+    let effective_batch = (batch_bytes.max(piece_length) / piece_length * piece_length)
+        .min(usize::try_from(total).unwrap_or(usize::MAX));
     let piece_count = usize::try_from(total.div_ceil(piece_bytes))
         .context("piece count exceeds the supported size")?;
     let batch_count = usize::try_from(total.div_ceil(effective_batch as u64))
@@ -324,6 +326,16 @@ mod tests {
         );
         assert!(hash_v1_buffered(&[], 3, 2, 0).unwrap().is_empty());
         assert!(hash_v1_buffered(&files[..1], 3, 2, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tiny_input_caps_an_oversized_batch_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let entries = [file(directory.path(), "small", b"abc")];
+        assert_eq!(
+            hash_v1_buffered(&entries, 64 * 1024 * 1024, 16, usize::MAX).unwrap(),
+            expected(b"abc", 64 * 1024 * 1024)
+        );
     }
 
     #[test]

@@ -34,7 +34,7 @@ impl System {
         }
         let ceiling = match self.storage {
             "rotational" => 2,
-            "solid-state" => 16,
+            "solid-state" => self.physical_cores.min(32),
             _ => self.physical_cores.min(16),
         };
         let memory_jobs = (self.available_memory_bytes / (piece_length as u64 * 32).max(1))
@@ -78,7 +78,7 @@ fn physical_cores() -> Option<usize> {
 
 #[cfg(target_os = "linux")]
 fn available_memory() -> u64 {
-    fs::read_to_string("/proc/meminfo")
+    let available = fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|text| {
             text.lines().find_map(|line| {
@@ -89,7 +89,63 @@ fn available_memory() -> u64 {
                     .ok()
             })
         })
-        .map_or(2 * 1024 * 1024 * 1024, |kb| kb.saturating_mul(1024))
+        .map_or(2 * 1024 * 1024 * 1024, |kb| kb.saturating_mul(1024));
+    let root = Path::new("/sys/fs/cgroup");
+    let mut budget = available;
+    if let Ok(groups) = fs::read_to_string("/proc/self/cgroup") {
+        for group in groups.lines() {
+            let Some((hierarchy, controllers, path)) =
+                group.split_once(':').and_then(|(first, rest)| {
+                    rest.split_once(':')
+                        .map(|(controllers, path)| (first, controllers, path))
+                })
+            else {
+                continue;
+            };
+            let (base, limit, usage) = if hierarchy == "0" && controllers.is_empty() {
+                (root.to_path_buf(), "memory.max", "memory.current")
+            } else if controllers
+                .split(',')
+                .any(|controller| controller == "memory")
+            {
+                (
+                    root.join("memory"),
+                    "memory.limit_in_bytes",
+                    "memory.usage_in_bytes",
+                )
+            } else {
+                continue;
+            };
+            if path.split('/').any(|component| component == "..") {
+                continue;
+            }
+            let mut directory = base.join(path.trim_start_matches('/'));
+            loop {
+                if let Some(remaining) = memory_remaining(&directory, limit, usage) {
+                    budget = budget.min(remaining);
+                }
+                if directory == base || !directory.pop() || !directory.starts_with(&base) {
+                    break;
+                }
+            }
+        }
+    }
+    budget
+}
+
+#[cfg(target_os = "linux")]
+fn memory_remaining(directory: &Path, limit: &str, usage: &str) -> Option<u64> {
+    let limit = fs::read_to_string(directory.join(limit))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let usage = fs::read_to_string(directory.join(usage))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(limit.saturating_sub(usage))
 }
 
 #[cfg(target_os = "windows")]
@@ -176,4 +232,30 @@ fn storage_kind(path: &Path) -> &'static str {
 #[cfg(not(target_os = "linux"))]
 fn storage_kind(_: &Path) -> &'static str {
     "unknown"
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_handles_unlimited_and_exhausted_cgroups() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("memory.max"), "1048576\n").unwrap();
+        fs::write(directory.path().join("memory.current"), "65536\n").unwrap();
+        assert_eq!(
+            memory_remaining(directory.path(), "memory.max", "memory.current"),
+            Some(983040)
+        );
+        fs::write(directory.path().join("memory.max"), "max\n").unwrap();
+        assert_eq!(
+            memory_remaining(directory.path(), "memory.max", "memory.current"),
+            None
+        );
+        fs::write(directory.path().join("memory.max"), "1\n").unwrap();
+        assert_eq!(
+            memory_remaining(directory.path(), "memory.max", "memory.current"),
+            Some(0)
+        );
+    }
 }

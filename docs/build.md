@@ -60,5 +60,6 @@ executable, README, license, and third-party notices.
 Run the `Release` GitHub Actions workflow manually to test and download build
 artifacts. Select its `publish` input to also publish the version from
 `Cargo.toml`, or push a matching version tag such as `v0.1.0`. Publication waits
-for both Linux architectures and Windows to pass their tests. Published downloads
-have stable names and a combined `SHA256SUMS` file.
+for both Linux architectures and Windows to pass their tests, formatting and
+Clippy checks, and a test run with the minimum supported Rust version. Published
+downloads have stable names and a combined `SHA256SUMS` file.

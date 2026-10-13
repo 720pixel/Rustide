@@ -1174,21 +1174,163 @@ mod padding_io {
     }
 }
 
+#[cfg(windows)]
+mod padding_io {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    use super::*;
+
+    const OPEN_REPARSE_POINT: u32 = 0x00200000;
+    const BACKUP_SEMANTICS: u32 = 0x02000000;
+    const READ_ATTRIBUTES: u32 = 0x80;
+    const SHARE_READ: u32 = 1;
+
+    pub(super) struct Root {
+        path: PathBuf,
+        _guards: Vec<File>,
+    }
+
+    fn guard_directory(path: &Path) -> Result<File> {
+        // Keep directory handles open without delete or write sharing while
+        // children are created. Junctions are inspected rather than followed.
+        let file = fs::OpenOptions::new()
+            .access_mode(READ_ATTRIBUTES)
+            .share_mode(SHARE_READ)
+            .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_dir() && metadata.file_attributes() & 0x400 == 0,
+            "padding directory is not a regular directory: {}",
+            path.display()
+        );
+        Ok(file)
+    }
+
+    impl Root {
+        pub(super) fn open(root: &Path) -> Result<Self> {
+            ensure!(root.is_absolute(), "padding root must be absolute");
+            let mut path = PathBuf::new();
+            let mut guards = Vec::new();
+            for component in root.components() {
+                path.push(component.as_os_str());
+                match component {
+                    std::path::Component::Prefix(_) => {}
+                    std::path::Component::RootDir | std::path::Component::Normal(_) => {
+                        guards.push(guard_directory(&path)?);
+                    }
+                    _ => bail!("padding root must be canonical"),
+                }
+            }
+            Ok(Self {
+                path,
+                _guards: guards,
+            })
+        }
+
+        pub(super) fn ensure(&self, components: &[Vec<u8>], length: u64) -> Result<bool> {
+            let (name, parents) = components.split_last().context("empty padding path")?;
+            let mut path = self.path.clone();
+            let mut guards = Vec::new();
+            for parent in parents {
+                path.push(component_path(parent)?);
+                match fs::create_dir(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error).context("create padding directory"),
+                }
+                guards.push(guard_directory(&path)?);
+            }
+            path.push(component_path(name)?);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(SHARE_READ)
+                .custom_flags(OPEN_REPARSE_POINT)
+                .open(&path)
+            {
+                Ok(file) => {
+                    file.set_len(length)?;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let file = fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(SHARE_READ)
+                        .custom_flags(OPEN_REPARSE_POINT)
+                        .open(&path)?;
+                    ensure!(
+                        file.metadata()?.file_attributes() & 0x400 == 0,
+                        "padding file is a reparse point"
+                    );
+                    check_padding_file(file, length, &path)?;
+                    Ok(false)
+                }
+                Err(error) => Err(error).context("create padding file"),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn directory_guard_blocks_replacement_until_released() {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().join("data");
+            fs::create_dir(&directory).unwrap();
+            let root = Root::open(&directory.canonicalize().unwrap()).unwrap();
+            assert!(fs::rename(&directory, temporary.path().join("moved")).is_err());
+            let path = vec![b".pad".to_vec(), b"zero".to_vec()];
+            assert!(root.ensure(&path, 16383).unwrap());
+            assert!(!root.ensure(&path, 16383).unwrap());
+            drop(root);
+            fs::rename(&directory, temporary.path().join("moved")).unwrap();
+        }
+
+        #[test]
+        fn junction_padding_directory_is_rejected() {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().join("data");
+            let outside = temporary.path().join("outside");
+            fs::create_dir(&directory).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let junction = directory.join(".pad");
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(&outside)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let root = Root::open(&directory.canonicalize().unwrap()).unwrap();
+            assert!(
+                root.ensure(&[b".pad".to_vec(), b"zero".to_vec()], 16383)
+                    .is_err()
+            );
+            assert!(!outside.join("zero").exists());
+            drop(root);
+            fs::remove_dir(junction).unwrap();
+        }
+    }
+}
+
 pub fn pad(document: &Document, target: &Path) -> Result<usize> {
     validate(document)?;
     let files = files(document)?;
     let root = payload_root(document, target, &files)?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let directory = padding_io::Root::open(&root)?;
     let mut created = 0;
     for file in files.iter().filter(|f| f.padding) {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             if directory.ensure(&file.components, file.length)? {
                 created += 1;
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             let path = checked_payload_path(&root, &file.components, false)?;
             if path.exists() {
