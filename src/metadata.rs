@@ -358,7 +358,6 @@ pub fn validate(document: &Document) -> Result<()> {
             let root = file
                 .pieces_root
                 .context("nonempty file has no pieces root")?;
-            expected.insert(root.to_vec());
             let layer = layers
                 .get(root.as_slice())
                 .and_then(Value::as_bytes)
@@ -368,14 +367,15 @@ pub fn validate(document: &Document) -> Result<()> {
                     && layer.len() as u64 / 32 == file.length.div_ceil(piece_length as u64),
                 "piece layer length does not match file length"
             );
-            let hashes: Vec<[u8; 32]> = layer.as_chunks::<32>().0.to_vec();
-            ensure!(
-                merkle::combine_root(
-                    &hashes,
-                    (piece_length / merkle::BLOCK_LENGTH).trailing_zeros() as usize
-                ) == root,
-                "piece layer does not match file root"
-            );
+            if expected.insert(root.to_vec()) {
+                ensure!(
+                    merkle::combine_root(
+                        layer.as_chunks::<32>().0,
+                        (piece_length / merkle::BLOCK_LENGTH).trailing_zeros() as usize
+                    ) == root,
+                    "piece layer does not match file root"
+                );
+            }
         }
         ensure!(
             layers.keys().all(|key| expected.contains(key)),
@@ -830,6 +830,31 @@ pub fn edit(document: &Document, options: &EditOptions) -> Result<Value> {
     Ok(value)
 }
 
+#[cfg(any(windows, test))]
+fn windows_component_safe(component: &str) -> bool {
+    if component.ends_with(['.', ' '])
+        || component
+            .chars()
+            .any(|c| c < ' ' || matches!(c, '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let upper = component.to_ascii_uppercase();
+    let stem = upper.split('.').next().unwrap_or("").trim_end_matches(' ');
+    if matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return false;
+    }
+    let port = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"));
+    !port.is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    })
+}
+
 fn component_path(component: &[u8]) -> Result<PathBuf> {
     safe_component(component)?;
     #[cfg(unix)]
@@ -839,9 +864,13 @@ fn component_path(component: &[u8]) -> Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        Ok(PathBuf::from(
-            std::str::from_utf8(component).context("file path is not valid UTF-8")?,
-        ))
+        let component = std::str::from_utf8(component).context("file path is not valid UTF-8")?;
+        #[cfg(windows)]
+        ensure!(
+            windows_component_safe(component),
+            "path component is reserved or ambiguous on Windows"
+        );
+        Ok(PathBuf::from(component))
     }
 }
 
@@ -885,11 +914,19 @@ fn checked_payload_path(root: &Path, components: &[Vec<u8>], must_exist: bool) -
     for component in components {
         walk.push(component_path(component)?);
         match fs::symlink_metadata(&walk) {
-            Ok(meta) => ensure!(
-                !meta.file_type().is_symlink(),
-                "payload path contains a symbolic link: {}",
-                walk.display()
-            ),
+            Ok(meta) => {
+                let is_link = meta.file_type().is_symlink();
+                #[cfg(windows)]
+                let is_link = {
+                    use std::os::windows::fs::MetadataExt;
+                    is_link || meta.file_attributes() & 0x400 != 0
+                };
+                ensure!(
+                    !is_link,
+                    "payload path contains a symbolic link or reparse point: {}",
+                    walk.display()
+                );
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !must_exist => {}
             Err(error) => {
                 return Err(error).with_context(|| format!("cannot access {}", walk.display()));
@@ -991,42 +1028,183 @@ pub fn verify(document: &Document, target: &Path, workers: Option<usize>) -> Res
     )
 }
 
+fn check_padding_file(mut file: File, length: u64, path: &Path) -> Result<()> {
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.len() == length,
+        "existing padding file has the wrong size or type: {}",
+        path.display()
+    );
+    let mut buffer = [0u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        ensure!(
+            buffer[..count].iter().all(|byte| *byte == 0),
+            "existing padding file contains nonzero bytes: {}",
+            path.display()
+        );
+        remaining -= count as u64;
+    }
+    ensure!(
+        file.read(&mut buffer[..1])? == 0 && file.metadata()?.len() == length,
+        "padding file length changed while reading {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+mod padding_io {
+    use std::{
+        ffi::{CStr, CString},
+        io,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::ffi::OsStrExt,
+        },
+        path::Component,
+    };
+
+    use super::*;
+
+    pub(super) struct Root {
+        directory: File,
+        path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    const DIRECTORY_FLAGS: i32 = libc::O_PATH | libc::O_DIRECTORY;
+    #[cfg(not(target_os = "linux"))]
+    const DIRECTORY_FLAGS: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
+
+    fn open_at(parent: &File, name: &CStr, flags: i32) -> io::Result<File> {
+        // The path is one checked component; successful descriptors become
+        // owned Files immediately, so every error path closes them.
+        let descriptor = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o666,
+            )
+        };
+        if descriptor < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            // SAFETY: openat returned a fresh descriptor owned by this call.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+    }
+
+    fn directory_at(parent: &File, name: &CStr, create: bool) -> io::Result<File> {
+        match open_at(parent, name, DIRECTORY_FLAGS) {
+            Ok(directory) => return Ok(directory),
+            Err(error) if create && error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Another writer may create this component concurrently. Opening it
+        // afterward with O_NOFOLLOW still rejects a substituted symbolic link.
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        open_at(parent, name, DIRECTORY_FLAGS)
+    }
+
+    impl Root {
+        pub(super) fn open(path: &Path) -> Result<Self> {
+            ensure!(path.is_absolute(), "padding root must be absolute");
+            let mut directory = File::open("/")?;
+            for component in path.components() {
+                match component {
+                    Component::RootDir => {}
+                    Component::Normal(name) => {
+                        let name = CString::new(name.as_bytes())?;
+                        directory = directory_at(&directory, &name, false)
+                            .with_context(|| format!("open padding root {}", path.display()))?;
+                    }
+                    _ => bail!("padding root must be canonical"),
+                }
+            }
+            Ok(Self {
+                directory,
+                path: path.to_path_buf(),
+            })
+        }
+
+        pub(super) fn ensure(&self, components: &[Vec<u8>], length: u64) -> Result<bool> {
+            let (name, parents) = components.split_last().context("empty padding path")?;
+            for component in components {
+                safe_component(component)?;
+            }
+            let path = self.path.join(relative_path(components)?);
+            let mut directory = self.directory.try_clone()?;
+            for parent in parents {
+                directory = directory_at(&directory, &CString::new(parent.as_slice())?, true)
+                    .with_context(|| format!("open padding directory for {}", path.display()))?;
+            }
+            let name = CString::new(name.as_slice())?;
+            match open_at(
+                &directory,
+                &name,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            ) {
+                Ok(file) => {
+                    file.set_len(length)?;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // Nonblocking open avoids waiting on a substituted FIFO.
+                    // The descriptor's type is checked before any reads.
+                    let file = open_at(&directory, &name, libc::O_RDONLY | libc::O_NONBLOCK)
+                        .with_context(|| format!("open existing padding {}", path.display()))?;
+                    check_padding_file(file, length, &path)?;
+                    Ok(false)
+                }
+                Err(error) => {
+                    Err(error).with_context(|| format!("create padding {}", path.display()))
+                }
+            }
+        }
+    }
+}
+
 pub fn pad(document: &Document, target: &Path) -> Result<usize> {
     validate(document)?;
     let files = files(document)?;
     let root = payload_root(document, target, &files)?;
+    #[cfg(unix)]
+    let directory = padding_io::Root::open(&root)?;
     let mut created = 0;
     for file in files.iter().filter(|f| f.padding) {
-        let path = checked_payload_path(&root, &file.components, false)?;
-        if path.exists() {
-            let metadata = fs::metadata(&path)?;
-            ensure!(
-                metadata.is_file() && metadata.len() == file.length,
-                "existing padding file has the wrong size or type: {}",
-                path.display()
-            );
-            let mut existing = File::open(&path)?;
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let length = existing.read(&mut buffer)?;
-                if length == 0 {
-                    break;
-                }
-                ensure!(
-                    buffer[..length].iter().all(|byte| *byte == 0),
-                    "existing padding file contains nonzero bytes: {}",
-                    path.display()
-                );
+        #[cfg(unix)]
+        {
+            if directory.ensure(&file.components, file.length)? {
+                created += 1;
             }
-            continue;
         }
-        fs::create_dir_all(path.parent().context("padding path has no parent")?)?;
-        let output = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        output.set_len(file.length)?;
-        created += 1;
+        #[cfg(not(unix))]
+        {
+            let path = checked_payload_path(&root, &file.components, false)?;
+            if path.exists() {
+                check_padding_file(File::open(&path)?, file.length, &path)?;
+                continue;
+            }
+            fs::create_dir_all(path.parent().context("padding path has no parent")?)?;
+            // Recheck newly created directories for links and reparse points.
+            checked_payload_path(&root, &file.components, false)?;
+            let output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            output.set_len(file.length)?;
+            created += 1;
+        }
     }
     Ok(created)
 }
@@ -1305,5 +1483,145 @@ mod tests {
             query(&document.value, "/info/pieces").unwrap()
         );
         assert_eq!(verify(&edited, &path, Some(1)).unwrap()["valid"], true);
+    }
+    #[test]
+    fn shared_piece_layers_still_check_every_file_length() {
+        let layer = [[1_u8; 32], [2_u8; 32]];
+        let root = merkle::combine_root(&layer, 0);
+        let properties = Value::Dict(BTreeMap::from([(
+            Vec::new(),
+            Value::Dict(BTreeMap::from([
+                (
+                    b"length".to_vec(),
+                    Value::Int((2 * merkle::BLOCK_LENGTH) as i64),
+                ),
+                (b"pieces root".to_vec(), Value::Bytes(root.to_vec())),
+            ])),
+        )]));
+        let value = Value::Dict(BTreeMap::from([
+            (
+                b"info".to_vec(),
+                Value::Dict(BTreeMap::from([
+                    (b"name".to_vec(), Value::Bytes(b"shared".to_vec())),
+                    (b"meta version".to_vec(), Value::Int(2)),
+                    (
+                        b"piece length".to_vec(),
+                        Value::Int(merkle::BLOCK_LENGTH as i64),
+                    ),
+                    (
+                        b"file tree".to_vec(),
+                        Value::Dict(BTreeMap::from([
+                            (b"a".to_vec(), properties.clone()),
+                            (b"b".to_vec(), properties),
+                        ])),
+                    ),
+                ])),
+            ),
+            (
+                b"piece layers".to_vec(),
+                Value::Dict(BTreeMap::from([(
+                    root.to_vec(),
+                    Value::Bytes(layer.concat()),
+                )])),
+            ),
+        ]));
+        from_value(value.clone()).unwrap();
+        let mut wrong_length = value.clone();
+        wrong_length
+            .get_mut(b"info")
+            .unwrap()
+            .get_mut(b"file tree")
+            .unwrap()
+            .get_mut(b"b")
+            .unwrap()
+            .get_mut(b"")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .insert(
+                b"length".to_vec(),
+                Value::Int((3 * merkle::BLOCK_LENGTH) as i64),
+            );
+        assert!(from_value(wrong_length).is_err());
+        let mut corrupted = value;
+        corrupted
+            .get_mut(b"piece layers")
+            .unwrap()
+            .as_dict_mut()
+            .unwrap()
+            .insert(root.to_vec(), Value::Bytes(vec![0; 64]));
+        assert!(from_value(corrupted).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn padding_directory_descriptor_survives_path_replacement() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let held = temp.path().join("held");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let directory = padding_io::Root::open(&root).unwrap();
+        fs::rename(&root, &held).unwrap();
+        symlink(&outside, &root).unwrap();
+        let path = [b"nested".to_vec(), b"zero".to_vec()];
+        assert!(directory.ensure(&path, 17).unwrap());
+        assert_eq!(fs::read(held.join("nested/zero")).unwrap(), vec![0; 17]);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!directory.ensure(&path, 17).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn padding_refuses_ancestor_links_final_links_and_fifos() {
+        use std::{
+            ffi::CString,
+            os::unix::{ffi::OsStrExt, fs::symlink},
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("data"), b"unchanged").unwrap();
+        let directory = padding_io::Root::open(&root).unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+        assert!(
+            directory
+                .ensure(&[b"linked".to_vec(), b"new".to_vec()], 32)
+                .is_err()
+        );
+        symlink(outside.join("data"), root.join("final")).unwrap();
+        assert!(directory.ensure(&[b"final".to_vec()], 9).is_err());
+        assert_eq!(fs::read(outside.join("data")).unwrap(), b"unchanged");
+        assert!(!outside.join("new").exists());
+        let fifo = CString::new(root.join("fifo").as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string is live and references a path inside this test's directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(directory.ensure(&[b"fifo".to_vec()], 0).is_err());
+        fs::write(root.join("nonzero"), b"x").unwrap();
+        assert!(directory.ensure(&[b"nonzero".to_vec()], 1).is_err());
+    }
+    #[test]
+    fn windows_payload_components_reject_device_and_normalization_aliases() {
+        for name in [
+            "NUL",
+            "nul.txt",
+            "CON",
+            "LPT9.data",
+            "COM¹",
+            ".. ",
+            "name.",
+            "name ",
+            "a?b",
+            "CONOUT$",
+        ] {
+            assert!(!windows_component_safe(name), "accepted {name:?}");
+        }
+        for name in ["normal", "a.b", "COM10", "NULL", "résumé"] {
+            assert!(windows_component_safe(name), "rejected {name:?}");
+        }
     }
 }

@@ -108,9 +108,27 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  quality:
+    name: Formatting, lint, and minimum Rust version
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install release and minimum Rust toolchains
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt,clippy
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Check formatting and warnings
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+      - name: Test minimum supported Rust version
+        run: cargo +1.89.0 test --locked --all-targets
+
   publish:
     if: startsWith(github.ref, 'refs/tags/') || inputs.publish
-    needs: [linux, windows]
+    needs: [linux, windows, quality]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

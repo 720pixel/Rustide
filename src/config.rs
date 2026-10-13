@@ -76,19 +76,27 @@ impl Config {
     }
 
     pub fn announces(&self, values: &[String], groups: &[String]) -> Result<AnnounceSettings> {
+        const MAX_URL: usize = 16 * 1024;
+        const MAX_URLS: usize = 4096;
+        const MAX_TOTAL: usize = 4 * 1024 * 1024;
         let mut tiers = Vec::new();
         let mut private = None;
         let mut source = None;
         let mut all = values.to_vec();
+        ensure!(all.len() <= MAX_URLS, "too many announce URLs");
         for group in groups {
-            all.extend(
-                self.tracker_groups
-                    .get(group)
-                    .with_context(|| format!("unknown announce group: {group}"))?
-                    .iter()
-                    .cloned(),
+            let entries = self
+                .tracker_groups
+                .get(group)
+                .with_context(|| format!("unknown announce group: {group}"))?;
+            ensure!(
+                entries.len() <= MAX_URLS.saturating_sub(all.len()),
+                "too many announce URLs"
             );
+            all.extend(entries.iter().cloned());
         }
+        let mut total_bytes = 0usize;
+        let mut url_count = 0usize;
         for value in all {
             let grouped = value
                 .trim()
@@ -104,6 +112,7 @@ impl Config {
                             && t.abbreviation.eq_ignore_ascii_case(token))
                 }) {
                     let mut url = tracker.announce_url.clone();
+                    ensure!(url.len() <= MAX_URL, "announce URL exceeds 16 KiB");
                     while let Some(begin) = url.find('{') {
                         let end = url[begin..]
                             .find('}')
@@ -121,6 +130,11 @@ impl Config {
                             !replacement.contains(['{', '}']),
                             "announce parameter contains braces"
                         );
+                        ensure!(
+                            replacement.len()
+                                <= MAX_URL.saturating_sub(url.len() - (end - begin + 1)),
+                            "expanded announce URL exceeds 16 KiB"
+                        );
                         url.replace_range(begin..=end, replacement);
                     }
                     tier.push(url);
@@ -133,6 +147,15 @@ impl Config {
                 }
             }
             for url in &tier {
+                ensure!(url.len() <= MAX_URL, "announce URL exceeds 16 KiB");
+                total_bytes = total_bytes
+                    .checked_add(url.len())
+                    .context("announce size overflow")?;
+                url_count += 1;
+                ensure!(
+                    url_count <= MAX_URLS && total_bytes <= MAX_TOTAL,
+                    "announce metadata exceeds size limit"
+                );
                 ensure!(
                     url.starts_with("http://")
                         || url.starts_with("https://")
@@ -277,5 +300,44 @@ fn scalar(value: &serde_json::Value) -> Result<String> {
         serde_json::Value::Number(n) => Ok(n.to_string()),
         serde_json::Value::Bool(b) => Ok(b.to_string()),
         _ => bail!("profile values must be strings, numbers, booleans, or arrays of those"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_announce_parameter_amplification_before_expansion() {
+        let mut config = Config::default();
+        config.trackers.push(Tracker {
+            name: "example".into(),
+            announce_url: format!("https://example.invalid/{}", "{key}".repeat(100)),
+            ..Tracker::default()
+        });
+        config.tracker_parameters.insert(
+            "example".into(),
+            BTreeMap::from([("key".into(), "x".repeat(16 * 1024))]),
+        );
+        assert!(config.announces(&["example".into()], &[]).is_err());
+    }
+
+    #[test]
+    fn bounds_group_expansion_and_total_announce_count() {
+        let mut config = Config::default();
+        config.tracker_groups.insert(
+            "large".into(),
+            vec!["https://example.invalid/announce".into(); 4096],
+        );
+        assert!(
+            config
+                .announces(&[], &["large".into(), "large".into()])
+                .is_err()
+        );
+        assert!(
+            config
+                .announces(&["https://example.invalid/".repeat(1024)], &[])
+                .is_err()
+        );
     }
 }

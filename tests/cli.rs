@@ -7,7 +7,9 @@ use std::{
 use rustide::{bencode::Value, metadata};
 
 fn command() -> Command {
-    if let Some(runner) = std::env::var_os("RUSTIDE_TEST_BIN_RUNNER").filter(|value| !value.is_empty()) {
+    if let Some(runner) =
+        std::env::var_os("RUSTIDE_TEST_BIN_RUNNER").filter(|value| !value.is_empty())
+    {
         let mut command = Command::new(runner);
         command.arg(env!("CARGO_BIN_EXE_rustide"));
         command

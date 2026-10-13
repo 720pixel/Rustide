@@ -570,7 +570,7 @@ fn run(cli: Cli) -> Result<()> {
                             "{key:15} {}",
                             value
                                 .as_str()
-                                .map_or_else(|| value.to_string(), str::to_owned)
+                                .map_or_else(|| value.to_string(), terminal_text)
                         );
                     }
                 }
@@ -579,11 +579,14 @@ fn run(cli: Cli) -> Result<()> {
                         println!(
                             "{:12} {}",
                             file.length,
-                            file.components
-                                .iter()
-                                .map(|c| String::from_utf8_lossy(c))
-                                .collect::<Vec<_>>()
-                                .join("/")
+                            terminal_text(
+                                &file
+                                    .components
+                                    .iter()
+                                    .map(|c| String::from_utf8_lossy(c))
+                                    .collect::<Vec<_>>()
+                                    .join("/")
+                            )
                         );
                     }
                 }
@@ -669,11 +672,14 @@ fn show(args: ShowArgs) -> Result<()> {
                 println!(
                     "{}{}",
                     if args.tree { "  " } else { "" },
-                    file.components
-                        .iter()
-                        .map(|c| String::from_utf8_lossy(c))
-                        .collect::<Vec<_>>()
-                        .join("/")
+                    terminal_text(
+                        &file
+                            .components
+                            .iter()
+                            .map(|c| String::from_utf8_lossy(c))
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    )
                 );
             }
         }
@@ -729,7 +735,7 @@ fn show(args: ShowArgs) -> Result<()> {
                 for url in urls {
                     print!(
                         "{}{}",
-                        url.as_str().context("invalid announce URL")?,
+                        terminal_text(url.as_str().context("invalid announce URL")?),
                         if args.flat { "\n" } else { " " }
                     );
                 }
@@ -742,7 +748,7 @@ fn show(args: ShowArgs) -> Result<()> {
             .get(b"announce")
             .and_then(bencode::Value::as_str)
         {
-            println!("{url}");
+            println!("{}", terminal_text(url));
         }
         return Ok(());
     }
@@ -768,7 +774,7 @@ fn show(args: ShowArgs) -> Result<()> {
     let value = metadata::query(&document.value, pointer)?;
     if !args.json {
         if let Some(text) = value.as_str() {
-            println!("{text}");
+            println!("{}", terminal_text(text));
             return Ok(());
         }
         if let Some(integer) = value.as_int() {
@@ -798,7 +804,35 @@ fn main() {
         run(cli)
     });
     if let Err(error) = result {
-        eprintln!("rustide: {error:#}");
+        eprintln!("rustide: {}", terminal_text(&format!("{error:#}")));
         std::process::exit(1);
+    }
+}
+
+fn terminal_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                character.escape_default().to_string()
+            } else {
+                character.to_string()
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_text;
+
+    #[test]
+    fn terminal_output_escapes_controls_and_keeps_unicode_names() {
+        assert_eq!(
+            terminal_text("film\u{1b}[2J\n東京"),
+            "film\\u{1b}[2J\\n東京"
+        );
+        assert_eq!(terminal_text("x\u{202e}txt"), "x\\u{202e}txt");
     }
 }
