@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a release for the version in Cargo.toml
+        type: boolean
+        default: false
+
+# Release operations inherit repository visibility and request no administration access.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.99.0
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Install ARM test runner
+        if: matrix.arch == 'aarch64'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
+      - name: Test, build, and verify static release
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER: qemu-aarch64
+          RUSTIDE_TEST_BIN_RUNNER: ${{ matrix.arch == 'aarch64' && 'qemu-aarch64' || '' }}
+        run: bash scripts/build-release.sh '${{ matrix.target }}'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    runs-on: windows-2022
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup default $env:RUST_VERSION
+      - name: Test and build
+        shell: pwsh
+        run: |
+          cargo test --locked --target x86_64-pc-windows-msvc --all-targets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & target/x86_64-pc-windows-msvc/release/rustide.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify runtime imports and package
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $dumpbin = & $vswhere -latest -products '*' -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | Select-Object -First 1
+          if (!$dumpbin) { throw 'dumpbin.exe not found' }
+          $binary = 'target/x86_64-pc-windows-msvc/release/rustide.exe'
+          $imports = & $dumpbin /DEPENDENTS $binary
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect executable imports' }
+          $imports | Write-Output
+          if ($imports -match '(?i)(VCRUNTIME|MSVCP|CONCRT|ucrtbase|api-ms-win-crt)[^\s]*\.dll') {
+            throw 'Executable requires a separately installed C runtime'
+          }
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq 'rustide').version
+          $package = "rustide-v$version-windows-x86_64"
+          New-Item -ItemType Directory -Force "dist/$package" | Out-Null
+          Copy-Item $binary "dist/$package/rustide.exe"
+          Copy-Item LICENSE "dist/$package/LICENSE"
+          Copy-Item THIRD_PARTY_LICENSES.txt "dist/$package/THIRD_PARTY_LICENSES.txt"
+          Copy-Item README.md "dist/$package/README.md"
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
+          Copy-Item $binary "dist/$package.exe"
+          Remove-Item -Recurse "dist/$package"
+          Get-ChildItem dist -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)" | Set-Content -Encoding ascii "$($_.FullName).sha256"
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish verified downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)
+          tag="v$version"
+          if [[ "$RELEASE_REF" == refs/tags/* && "$RELEASE_REF" != "refs/tags/$tag" ]]; then
+            echo 'Tag must match the package version' >&2
+            exit 1
+          fi
+          (cd dist && cat *.sha256 | tr -d '\r' | sort -k2 > SHA256SUMS && sha256sum -c SHA256SUMS)
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$RELEASE_SHA" --title "Rustide $tag" --generate-notes --draft
+          fi
+          gh release upload "$tag" dist/*.tar.gz dist/*.zip dist/*.exe dist/SHA256SUMS LICENSE THIRD_PARTY_LICENSES.txt --clobber
+          gh release edit "$tag" --draft=false

@@ -1,0 +1,13 @@
+/target/
+/dist/
+/artifacts/
+/private/
+AGENTS.md
+agents.md
+*.torrent
+*.tmp
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db
