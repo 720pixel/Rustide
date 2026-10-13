@@ -6,6 +6,7 @@ AGENTS.md
 agents.md
 *.torrent
 *.tmp
+*.orig
 *.log
 .env
 .env.*

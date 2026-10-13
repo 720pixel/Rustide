@@ -1,3 +1,4 @@
+pub mod direct;
 pub mod reader;
 pub mod sha1;
 

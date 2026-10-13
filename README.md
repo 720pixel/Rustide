@@ -6,7 +6,7 @@ Fast torrent hashing, creation, and editing for Linux and Windows. A single exec
 rustide /path/to/file-or-folder output.torrent
 ```
 
-Rustide hashes pieces in parallel, uses wide-vector SHA-1 where the CPU supports it, and reads file data through memory mappings. CPU acceleration is selected at runtime, so the same download works on older and newer processors.
+Rustide hashes pieces in parallel and selects hardware SHA instructions or wide-vector SHA-1 at runtime. On Linux SSDs, direct reads avoid page-cache and mapping overhead for v1 hashing. A bounded sequential reader handles hard disks, with mapped reads available for other workloads. The same download works on older and newer processors.
 
 ## Download
 
@@ -51,6 +51,8 @@ rustide ./data data.torrent --piece-size 64MiB
 Sizes also accept bytes and power-of-two exponents: `--piece-size 24` means 16 MiB.
 
 The worker pool is chosen from available CPUs, storage type, memory, and the amount of work. Override it with `--threads 16`. More workers can add overhead once storage throughput is saturated.
+
+Use `--io direct`, `--io mmap`, or `--io buffered` to choose the read method explicitly. Direct reads fall back to buffered reads where needed. Keep input files unchanged while they are being hashed.
 
 Other creation options include:
 

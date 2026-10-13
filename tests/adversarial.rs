@@ -346,7 +346,7 @@ fn library_creation_rejects_nonstandard_similar_hash_lengths() {
 }
 
 #[test]
-fn buffered_and_mapped_creation_match_across_file_and_piece_boundaries() {
+fn io_modes_match_across_file_and_piece_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     for (index, length) in [
         0,
@@ -380,20 +380,22 @@ fn buffered_and_mapped_creation_match_across_file_and_piece_boundaries() {
                 ..options.clone()
             })
             .unwrap();
-            let buffered = create::create(&CreateOptions {
-                io: create::IoMode::Buffered,
-                ..options
-            })
-            .unwrap();
-            assert_eq!(
-                mapped.value, buffered.value,
-                "I/O mode changed {protocol:?} at piece size {piece_length}"
-            );
-            let document = metadata::from_value(buffered.value).unwrap();
-            assert_eq!(
-                metadata::verify(&document, temp.path(), Some(2)).unwrap()["valid"],
-                true
-            );
+            for io in [create::IoMode::Buffered, create::IoMode::Direct] {
+                let other = create::create(&CreateOptions {
+                    io,
+                    ..options.clone()
+                })
+                .unwrap();
+                assert_eq!(
+                    mapped.value, other.value,
+                    "I/O mode {io:?} changed {protocol:?} at piece size {piece_length}"
+                );
+                let document = metadata::from_value(other.value).unwrap();
+                assert_eq!(
+                    metadata::verify(&document, temp.path(), Some(2)).unwrap()["valid"],
+                    true
+                );
+            }
         }
     }
 }

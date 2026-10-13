@@ -35,6 +35,7 @@ pub enum IoMode {
     Auto,
     Mmap,
     Buffered,
+    Direct,
 }
 
 impl FromStr for Protocol {
@@ -254,7 +255,10 @@ pub fn scan(options: &CreateOptions) -> Result<Vec<FileEntry>> {
             options.target.file_name().context("file has no name")?,
         ))?;
         files.push(FileEntry {
-            disk_path: options.target.clone(),
+            disk_path: options
+                .target
+                .canonicalize()
+                .context("cannot resolve input file")?,
             components,
             length: input.len(),
             padding: false,
@@ -302,7 +306,10 @@ pub fn scan(options: &CreateOptions) -> Result<Vec<FileEntry>> {
             }
             let metadata = entry.metadata().context("cannot read file metadata")?;
             files.push(FileEntry {
-                disk_path: entry.into_path(),
+                disk_path: entry
+                    .path()
+                    .canonicalize()
+                    .context("cannot resolve input file")?,
                 components,
                 length: metadata.len(),
                 padding: false,
@@ -362,7 +369,7 @@ pub fn hash_files(
         piece_length,
         protocol,
         workers,
-        IoMode::Mmap,
+        IoMode::Auto,
         piece_length.saturating_mul(16),
     )
 }
@@ -376,29 +383,35 @@ pub fn hash_files_with_io(
     batch_bytes: usize,
 ) -> Result<HashResult> {
     validate_piece_length(piece_length)?;
-    let buffered = if io == IoMode::Auto {
+    let io = if io == IoMode::Auto {
         files
             .iter()
             .find(|file| !file.padding)
-            .is_some_and(|file| System::detect(&file.disk_path).storage == "rotational")
+            .map_or(IoMode::Mmap, |file| {
+                automatic_io(&System::detect(&file.disk_path), protocol)
+            })
     } else {
-        io == IoMode::Buffered
+        io
     };
-    let buffered_v1 = if buffered && protocol != Protocol::V2 {
-        Some(hash::reader::hash_v1_buffered(
+    let buffered_v1 = match io {
+        IoMode::Direct if protocol != Protocol::V2 => Some(hash::direct::hash_v1_direct(
             files,
             piece_length,
             workers.max(1),
             batch_bytes,
-        )?)
-    } else {
-        None
+        )?),
+        IoMode::Buffered if protocol != Protocol::V2 => Some(hash::reader::hash_v1_buffered(
+            files,
+            piece_length,
+            workers.max(1),
+            batch_bytes,
+        )?),
+        _ => None,
     };
-    if protocol == Protocol::V1 && buffered {
-        return Ok(HashResult {
-            v1: buffered_v1.unwrap(),
-            v2: Vec::new(),
-        });
+    if protocol == Protocol::V1
+        && let Some(v1) = buffered_v1
+    {
+        return Ok(HashResult { v1, v2: Vec::new() });
     }
     let total = total_length(files)?;
     let count: usize = total
@@ -408,6 +421,7 @@ pub fn hash_files_with_io(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(workers.max(1))
         .build()?;
+    let batch_size = 16;
     let shared_maps = if files.len() <= 256 {
         Some(
             files
@@ -435,10 +449,10 @@ pub fn hash_files_with_io(
             v1
         } else if protocol != Protocol::V2 {
             let mut hashes = vec![[0u8; 20]; count];
-            hashes.par_chunks_mut(16).enumerate().try_for_each(
+            hashes.par_chunks_mut(batch_size).enumerate().try_for_each(
                 |(batch, output)| -> Result<()> {
                     let starts: Vec<u64> = (0..output.len())
-                        .map(|i| ((batch * 16 + i) as u64) * piece_length as u64)
+                        .map(|i| ((batch * batch_size + i) as u64) * piece_length as u64)
                         .collect();
                     let mut local = BTreeMap::new();
                     if shared_maps.is_none() {
@@ -456,6 +470,38 @@ pub fn hash_files_with_io(
                         }
                         for index in needed {
                             local.insert(index, map_file(&files[index])?);
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Populate contiguous pages before the lanes read separate pieces.
+                        let start = starts[0];
+                        let stop = start
+                            .saturating_add((output.len() * piece_length) as u64)
+                            .min(total);
+                        let mut position = start;
+                        while position < stop {
+                            let index = ends.partition_point(|&end| end <= position);
+                            let previous = if index == 0 { 0 } else { ends[index - 1] };
+                            let take = (ends[index].min(stop) - position) as usize;
+                            if !files[index].padding {
+                                let mapping = match &shared_maps {
+                                    Some(maps) => maps[index].as_ref().unwrap(),
+                                    None => &local[&index],
+                                };
+                                let begin = (position - previous) as usize;
+                                if mapping
+                                    .advise_range(memmap2::Advice::PopulateRead, begin, take)
+                                    .is_err()
+                                {
+                                    let _ = mapping.advise_range(
+                                        memmap2::Advice::WillNeed,
+                                        begin,
+                                        take,
+                                    );
+                                }
+                            }
+                            position += take as u64;
                         }
                     }
                     let mapping = |index: usize| -> &[u8] {
@@ -620,17 +666,22 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
         }
     }
     let system = System::detect(&options.target);
-    let workers = system.workers(
-        options.threads,
-        offset.div_ceil(piece_length as u64),
-        piece_length,
-    );
-    let hashing = Instant::now();
     let io = match options.io {
-        IoMode::Auto if system.storage == "rotational" => IoMode::Buffered,
-        IoMode::Auto => IoMode::Mmap,
+        IoMode::Auto => automatic_io(&system, options.protocol),
         mode => mode,
     };
+    let workers = system
+        .workers(
+            options.threads,
+            offset.div_ceil(piece_length as u64),
+            piece_length,
+        )
+        .min(if io == IoMode::Direct && options.threads.is_none() {
+            8
+        } else {
+            usize::MAX
+        });
+    let hashing = Instant::now();
     let batch_bytes = piece_length
         .saturating_mul(16)
         .min(
@@ -837,7 +888,14 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
             payload_bytes,
             piece_bytes: piece_length,
             workers,
-            io_backend: if io == IoMode::Buffered && options.protocol != Protocol::V2 {
+            io_backend: if io == IoMode::Direct
+                && options.protocol != Protocol::V2
+                && cfg!(target_os = "linux")
+            {
+                "direct"
+            } else if matches!(io, IoMode::Buffered | IoMode::Direct)
+                && options.protocol != Protocol::V2
+            {
                 "buffered"
             } else {
                 "mmap"
@@ -852,6 +910,19 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
             system,
         },
     })
+}
+
+fn automatic_io(system: &System, protocol: Protocol) -> IoMode {
+    if system.storage == "rotational" {
+        IoMode::Buffered
+    } else if cfg!(target_os = "linux")
+        && system.storage == "solid-state"
+        && protocol == Protocol::V1
+    {
+        IoMode::Direct
+    } else {
+        IoMode::Mmap
+    }
 }
 
 #[cfg(test)]

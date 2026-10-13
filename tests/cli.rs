@@ -682,12 +682,12 @@ fn invalid_piece_sizes_and_thread_counts_fail_without_output() {
 }
 
 #[test]
-fn explicit_buffered_io_matches_mmap_output_and_rejects_unknown_modes() {
+fn explicit_io_modes_match_output_and_reject_unknown_modes() {
     let (dir, config, input) = setup();
     fs::write(&input, vec![37; 3 * rustide::merkle::BLOCK_LENGTH + 17]).unwrap();
     for protocol in ["v1", "v2", "hybrid"] {
         let mut outputs = Vec::new();
-        for mode in ["mmap", "buffered"] {
+        for mode in ["mmap", "buffered", "direct"] {
             let destination = dir.path().join(format!("{protocol}-{mode}.torrent"));
             success(run(
                 &config,
@@ -705,10 +705,9 @@ fn explicit_buffered_io_matches_mmap_output_and_rejects_unknown_modes() {
             ));
             outputs.push(fs::read(destination).unwrap());
         }
-        assert_eq!(
-            outputs[0], outputs[1],
-            "I/O mode changed {protocol} metadata"
-        );
+        for output in &outputs[1..] {
+            assert_eq!(outputs[0], *output, "I/O mode changed {protocol} metadata");
+        }
     }
     let destination = dir.path().join("invalid-io.torrent");
     assert!(

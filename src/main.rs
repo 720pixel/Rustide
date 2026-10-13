@@ -76,7 +76,7 @@ struct CreateArgs {
         long,
         value_enum,
         default_value = "auto",
-        help = "Select automatic, mapped, or sequential buffered reads"
+        help = "Select automatic, mapped, buffered, or direct reads"
     )]
     io: create::IoMode,
     #[arg(short = 'a', long, num_args = 1.., value_name = "URL")]
