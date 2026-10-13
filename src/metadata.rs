@@ -1183,6 +1183,7 @@ mod padding_io {
     const OPEN_REPARSE_POINT: u32 = 0x00200000;
     const BACKUP_SEMANTICS: u32 = 0x02000000;
     const READ_ATTRIBUTES: u32 = 0x80;
+    const LIST_DIRECTORY: u32 = 1;
     const SHARE_READ: u32 = 1;
 
     pub(super) struct Root {
@@ -1194,7 +1195,7 @@ mod padding_io {
         // Keep directory handles open without delete or write sharing while
         // children are created. Junctions are inspected rather than followed.
         let file = fs::OpenOptions::new()
-            .access_mode(READ_ATTRIBUTES)
+            .access_mode(READ_ATTRIBUTES | LIST_DIRECTORY)
             .share_mode(SHARE_READ)
             .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
             .open(path)?;
