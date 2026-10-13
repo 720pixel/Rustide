@@ -1,6 +1,6 @@
 # Rustide
 
-Fast torrent hashing, creation, and editing for Linux and Windows. A single executable, with no runtime to install.
+A fast torrent hasher and metadata editor for Linux and Windows. A single executable, with no runtime to install.
 
 ```sh
 rustide /path/to/file-or-folder output.torrent

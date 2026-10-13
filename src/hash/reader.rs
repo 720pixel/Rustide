@@ -220,7 +220,7 @@ impl<'a> SequentialReader<'a> {
             let entry = &self.entries[self.index];
             if !self.initialized {
                 if !entry.padding {
-                    let file = File::open(&entry.disk_path)
+                    let file = crate::create::open_input_file(&entry.disk_path)
                         .with_context(|| format!("open {}", entry.disk_path.display()))?;
                     let metadata = file
                         .metadata()
@@ -292,6 +292,32 @@ mod tests {
     use std::{fs, io::Write, path::Path};
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_input_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("pipe");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // The CString stays alive for the syscall.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let entry = FileEntry {
+            disk_path: path,
+            components: vec![b"pipe".to_vec()],
+            length: 0,
+            padding: false,
+        };
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(hash_v1_buffered(&[entry], 16384, 1, 16384).is_err());
+        });
+        assert!(
+            receive
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+        );
+    }
 
     fn file(directory: &Path, name: &str, bytes: &[u8]) -> FileEntry {
         let disk_path = directory.join(name);

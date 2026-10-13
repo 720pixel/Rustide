@@ -333,12 +333,24 @@ pub fn scan(options: &CreateOptions) -> Result<Vec<FileEntry>> {
     Ok(files)
 }
 
+pub(crate) fn open_input_file(path: &Path) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
 fn map_file(entry: &FileEntry) -> Result<Mmap> {
-    let file = File::open(&entry.disk_path)
+    let file = open_input_file(&entry.disk_path)
         .with_context(|| format!("cannot open {}", entry.disk_path.display()))?;
+    let metadata = file.metadata()?;
     ensure!(
-        file.metadata()?.len() == entry.length,
-        "input file size changed: {}",
+        metadata.is_file() && metadata.len() == entry.length,
+        "input file type or size changed: {}",
         entry.disk_path.display()
     );
     ensure!(
