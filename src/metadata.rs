@@ -957,7 +957,9 @@ pub fn verify(document: &Document, target: &Path, workers: Option<usize>) -> Res
         } else if let Some(root) = &root {
             checked_payload_path(root, &file.components, true)?
         } else {
-            target.to_path_buf()
+            target
+                .canonicalize()
+                .context("cannot resolve payload file")?
         };
         if !file.padding {
             let metadata = fs::metadata(&disk_path)
@@ -975,11 +977,34 @@ pub fn verify(document: &Document, target: &Path, workers: Option<usize>) -> Res
             padding: file.padding,
         });
     }
-    let workers =
-        workers.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
-    ensure!(workers > 0, "worker count must be positive");
+    ensure!(workers != Some(0), "worker count must be positive");
     let protocol = protocol(document)?;
-    let actual = crate::create::hash_files(&entries, piece_length(document)?, protocol, workers)?;
+    let piece_length = piece_length(document)?;
+    let system = crate::system::System::detect(target);
+    let io = crate::create::automatic_io(&system, protocol);
+    let total = entries.iter().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.length)
+            .context("payload length overflow")
+    })?;
+    let count = system
+        .workers(workers, total.div_ceil(piece_length as u64), piece_length)
+        .min(
+            if io == crate::create::IoMode::Direct && workers.is_none() {
+                8
+            } else {
+                usize::MAX
+            },
+        );
+    let batch_bytes = crate::create::reader_batch_size(&system, count, piece_length);
+    let actual = crate::create::hash_files_with_io(
+        &entries,
+        piece_length,
+        protocol,
+        count,
+        io,
+        batch_bytes,
+    )?;
     let mut v1_mismatches = Vec::new();
     if matches!(protocol, Protocol::V1 | Protocol::Hybrid) {
         let expected = required(info(document)?, b"pieces")?
@@ -1355,6 +1380,26 @@ pub fn pad(document: &Document, target: &Path) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_symlink_file_targets_create_and_verify() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().unwrap();
+        let actual = temporary.path().join("actual.bin");
+        let alias = temporary.path().join("alias.bin");
+        fs::write(&actual, b"stable payload").unwrap();
+        symlink(&actual, &alias).unwrap();
+        let result = crate::create::create(&crate::create::CreateOptions {
+            target: alias.clone(),
+            io: crate::create::IoMode::Direct,
+            ..Default::default()
+        })
+        .unwrap();
+        let document = from_value(result.value).unwrap();
+        assert_eq!(verify(&document, &alias, None).unwrap()["valid"], true);
+        assert_eq!(verify(&document, &actual, None).unwrap()["valid"], true);
+    }
 
     fn simple() -> Document {
         // SHA-1 of the one-byte payload "x".

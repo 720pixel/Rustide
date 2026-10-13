@@ -682,13 +682,7 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
             usize::MAX
         });
     let hashing = Instant::now();
-    let batch_bytes = piece_length
-        .saturating_mul(16)
-        .min(
-            (system.available_memory_bytes / 4 / (workers as u64 + 1)).min(usize::MAX as u64)
-                as usize,
-        )
-        .max(piece_length);
+    let batch_bytes = reader_batch_size(&system, workers, piece_length);
     let hashes = hash_files_with_io(
         &files,
         piece_length,
@@ -912,7 +906,7 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
     })
 }
 
-fn automatic_io(system: &System, protocol: Protocol) -> IoMode {
+pub(crate) fn automatic_io(system: &System, protocol: Protocol) -> IoMode {
     if system.storage == "rotational" {
         IoMode::Buffered
     } else if cfg!(target_os = "linux")
@@ -923,6 +917,16 @@ fn automatic_io(system: &System, protocol: Protocol) -> IoMode {
     } else {
         IoMode::Mmap
     }
+}
+
+pub(crate) fn reader_batch_size(system: &System, workers: usize, piece_length: usize) -> usize {
+    piece_length
+        .saturating_mul(16)
+        .min(
+            (system.available_memory_bytes / 4 / (workers as u64 + 1)).min(usize::MAX as u64)
+                as usize,
+        )
+        .max(piece_length)
 }
 
 #[cfg(test)]

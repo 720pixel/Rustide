@@ -29,17 +29,17 @@ impl System {
 
     pub fn workers(&self, requested: Option<usize>, pieces: u64, piece_length: usize) -> usize {
         let jobs = pieces.div_ceil(16).max(1).min(usize::MAX as u64) as usize;
+        let memory_jobs = (self.available_memory_bytes / (piece_length as u64 * 32).max(1))
+            .max(1)
+            .min(usize::MAX as u64) as usize;
         if let Some(n) = requested {
-            return n.max(1).min(jobs);
+            return n.max(1).min(jobs).min(memory_jobs);
         }
         let ceiling = match self.storage {
             "rotational" => 2,
             "solid-state" => self.physical_cores.min(32),
             _ => self.physical_cores.min(16),
         };
-        let memory_jobs = (self.available_memory_bytes / (piece_length as u64 * 32).max(1))
-            .max(1)
-            .min(usize::MAX as u64) as usize;
         self.logical_cpus
             .min(ceiling)
             .min(memory_jobs)
@@ -237,6 +237,20 @@ fn storage_kind(_: &Path) -> &'static str {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_workers_still_respect_available_memory() {
+        let system = System {
+            architecture: "x86_64",
+            logical_cpus: 128,
+            physical_cores: 64,
+            available_memory_bytes: 256 * 1024 * 1024,
+            storage: "solid-state",
+            hash_backend: "portable",
+        };
+        assert_eq!(system.workers(Some(128), 4000, 16 * 1024 * 1024), 1);
+        assert_eq!(system.workers(None, 4000, 16 * 1024 * 1024), 1);
+    }
 
     #[test]
     fn memory_budget_handles_unlimited_and_exhausted_cgroups() {

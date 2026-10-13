@@ -498,7 +498,7 @@ fn run(cli: Cli) -> Result<()> {
                     result.report.hash_seconds, result.report.gib_per_second
                 );
                 if !args.stdout {
-                    eprintln!("Written to {}", output.display());
+                    eprintln!("Written to {}", terminal_text(&output.to_string_lossy()));
                 }
             }
         }
@@ -545,7 +545,7 @@ fn run(cli: Cli) -> Result<()> {
             if args.json && !args.stdout {
                 print_json(&metadata::inspect(&metadata::from_value(value)?)?)?;
             } else if !cli.quiet && !args.stdout {
-                eprintln!("Written to {}", output.display());
+                eprintln!("Written to {}", terminal_text(&output.to_string_lossy()));
             }
         }
         Command::Info(args) => {

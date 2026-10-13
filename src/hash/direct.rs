@@ -10,9 +10,9 @@ use anyhow::Result;
 /// less than 8 KiB of alignment slack. At most `min(workers, batches)` buffers
 /// are allocated; digest output and file descriptors require additional memory.
 /// Linux uses direct reads for batches contained in one file and ordinary reads
-/// for cross-file batches or unsupported filesystems. Inputs with more than 256
-/// real files, and other platforms, use the sequential buffered reader to bound
-/// open descriptors; that fallback can require one additional reader buffer.
+/// for cross-file batches or unsupported filesystems. Inputs exceeding the
+/// process descriptor budget or 256 real files, and other platforms, use the
+/// sequential reader; that fallback can require one additional reader buffer.
 /// Payloads must remain stable while hashing.
 pub fn hash_v1_direct(
     files: &[FileEntry],
@@ -20,11 +20,11 @@ pub fn hash_v1_direct(
     workers: usize,
     batch_bytes: usize,
 ) -> Result<Vec<[u8; 20]>> {
-    if files.iter().filter(|entry| !entry.padding).count() > 256 {
-        return super::reader::hash_v1_buffered(files, piece_length, workers, batch_bytes);
-    }
     #[cfg(target_os = "linux")]
     {
+        if files.iter().filter(|entry| !entry.padding).count() > linux::file_budget() {
+            return super::reader::hash_v1_buffered(files, piece_length, workers, batch_bytes);
+        }
         linux::hash(files, piece_length, workers, batch_bytes, true)
     }
     #[cfg(not(target_os = "linux"))]
@@ -51,6 +51,23 @@ mod linux {
     use rayon::prelude::*;
 
     const ALIGN: usize = 4096;
+
+    fn descriptor_budget(soft_limit: libc::rlim_t) -> usize {
+        // Each input may hold two descriptors. Reserve room for the caller,
+        // standard streams, runtime internals, and final output creation.
+        (soft_limit.saturating_sub(32) / 2).min(256) as usize
+    }
+
+    pub(super) fn file_budget() -> usize {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit writes a complete rlimit on success; its result is
+        // inspected before reading the initialized value.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return 0;
+        }
+        // SAFETY: the successful call above initialized the complete structure.
+        descriptor_budget(unsafe { limit.assume_init() }.rlim_cur)
+    }
 
     struct AlignedBuffer {
         pointer: NonNull<u8>,
@@ -337,6 +354,17 @@ mod linux {
     mod tests {
         use super::*;
         use std::fs;
+
+        #[test]
+        fn descriptor_budget_reserves_handles_and_keeps_the_upper_bound() {
+            assert_eq!(descriptor_budget(0), 0);
+            assert_eq!(descriptor_budget(32), 0);
+            assert_eq!(descriptor_budget(33), 0);
+            assert_eq!(descriptor_budget(34), 1);
+            assert_eq!(descriptor_budget(64), 16);
+            assert_eq!(descriptor_budget(1024), 256);
+            assert_eq!(descriptor_budget(libc::RLIM_INFINITY), 256);
+        }
 
         fn entry(root: &std::path::Path, name: &str, bytes: &[u8]) -> FileEntry {
             let path = root.join(name);
