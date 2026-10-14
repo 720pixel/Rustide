@@ -371,17 +371,8 @@ mod tests {
             (LocationKind::Output, "output"),
             (LocationKind::Torrent, "torrent"),
         ] {
-            assert_eq!(
-                restored.directory(kind),
-                Some(
-                    temporary
-                        .path()
-                        .join(name)
-                        .canonicalize()
-                        .unwrap()
-                        .as_path()
-                )
-            );
+            let expected = readable_path(temporary.path().join(name).canonicalize().unwrap());
+            assert_eq!(restored.directory(kind), Some(expected.as_path()));
         }
         let stored = fs::read_to_string(path).unwrap();
         assert!(!stored.contains("selected.torrent"));
