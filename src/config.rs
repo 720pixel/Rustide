@@ -42,7 +42,7 @@ pub type AnnounceSettings = (Vec<Vec<String>>, Option<bool>, Option<String>);
 fn default_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("rustide/config.json"));
+        std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("rustide/config.json"))
     }
     #[cfg(not(target_os = "windows"))]
     {

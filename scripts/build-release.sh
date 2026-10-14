@@ -26,8 +26,8 @@ unset CARGO_ENCODED_RUSTFLAGS
 export RUSTFLAGS='-C target-feature=+crt-static -C link-self-contained=yes'
 
 # Set CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUNNER=qemu-aarch64 when cross-testing.
-cargo test --locked --target "$target" --all-targets
-cargo build --locked --release --target "$target"
+cargo test --locked --features gui --target "$target" --all-targets
+cargo build --locked --features gui --release --target "$target" --bin rustide
 binary="${CARGO_TARGET_DIR:-target}/$target/release/rustide"
 program_headers=$(readelf -l "$binary")
 dynamic_section=$(readelf -d "$binary")
@@ -50,6 +50,9 @@ install -m 644 LICENSE "$stage/$package/LICENSE"
 install -m 644 THIRD_PARTY_LICENSES.txt "$stage/$package/THIRD_PARTY_LICENSES.txt"
 if [[ -f README.md ]]; then
   install -m 644 README.md "$stage/$package/README.md"
+  mkdir -p "$stage/$package/assets"
+  install -m 644 assets/rustide-mark.svg "$stage/$package/assets/rustide-mark.svg"
+  install -m 644 assets/desktop-create.png "$stage/$package/assets/desktop-create.png"
 fi
 tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
   -C "$stage" -cf - "$package" | gzip -n > "dist/$package.tar.gz"

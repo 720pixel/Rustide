@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 32 32">
+  <title>Rustide</title>
+  <rect x="1" y="1" width="30" height="30" rx="8" fill="#722c3f"/>
+  <g fill="#fff5e6">
+    <rect x="7.5" y="9.5" width="2" height="2"/>
+    <rect x="7.5" y="17.5" width="2" height="2"/>
+    <rect x="9" y="8" width="4" height="17"/>
+    <path d="M11 8H16.8C22.1 8 24 10.2 24 14.2C24 18.4 21.8 20.1 16.8 20.1H11Z"/>
+    <path d="M16 18.5H20L25 25H20.3Z"/>
+    <circle cx="23" cy="24.5" r="2.5"/>
+  </g>
+  <g fill="#722c3f">
+    <path d="M13 11.7H16.8C19.3 11.7 20.2 12.5 20.2 14.2C20.2 16 19.3 16.6 16.8 16.6H13Z"/>
+    <circle cx="23" cy="24.5" r="1"/>
+  </g>
+</svg>

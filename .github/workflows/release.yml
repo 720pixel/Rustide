@@ -63,17 +63,48 @@ jobs:
       - name: Install Rust
         shell: pwsh
         run: |
-          rustup toolchain install $env:RUST_VERSION --profile minimal
+          rustup toolchain install $env:RUST_VERSION --profile minimal --component clippy
           rustup default $env:RUST_VERSION
       - name: Test and build
         shell: pwsh
         run: |
-          cargo test --locked --target x86_64-pc-windows-msvc --all-targets
+          cargo test --locked --features gui --target x86_64-pc-windows-msvc --all-targets
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo build --locked --release --target x86_64-pc-windows-msvc
+          cargo clippy --locked --features gui --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --features gui --release --target x86_64-pc-windows-msvc --bin rustide
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & target/x86_64-pc-windows-msvc/release/rustide.exe --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify desktop startup and close
+        shell: pwsh
+        run: |
+          $binary = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/rustide.exe').Path
+          $desktop = Start-Process -FilePath $binary -ArgumentList 'gui' -PassThru
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+              $desktop.Refresh()
+              if ($desktop.HasExited) {
+                throw "Desktop exited before opening a window: $($desktop.ExitCode)"
+              }
+              if ($desktop.MainWindowHandle -ne [IntPtr]::Zero) { break }
+              Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $deadline)
+            if ($desktop.MainWindowHandle -eq [IntPtr]::Zero) {
+              throw 'Desktop did not open a window within 15 seconds'
+            }
+            if ($desktop.MainWindowTitle -notmatch 'Rustide') {
+              throw "Unexpected desktop window title: $($desktop.MainWindowTitle)"
+            }
+            if (!$desktop.CloseMainWindow()) { throw 'Desktop window could not be closed' }
+            if (!$desktop.WaitForExit(5000)) { throw 'Desktop did not exit after closing its window' }
+            if ($desktop.ExitCode -ne 0) { throw "Desktop exited with code $($desktop.ExitCode)" }
+          } finally {
+            $desktop.Refresh()
+            if (!$desktop.HasExited) { Stop-Process -Id $desktop.Id -Force }
+            $desktop.Dispose()
+          }
       - name: Verify runtime imports and package
         shell: pwsh
         run: |
@@ -95,6 +126,9 @@ jobs:
           Copy-Item LICENSE "dist/$package/LICENSE"
           Copy-Item THIRD_PARTY_LICENSES.txt "dist/$package/THIRD_PARTY_LICENSES.txt"
           Copy-Item README.md "dist/$package/README.md"
+          New-Item -ItemType Directory -Force "dist/$package/assets" | Out-Null
+          Copy-Item assets/rustide-mark.svg "dist/$package/assets/rustide-mark.svg"
+          Copy-Item assets/desktop-create.png "dist/$package/assets/desktop-create.png"
           Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip"
           Copy-Item $binary "dist/$package.exe"
           Remove-Item -Recurse "dist/$package"
@@ -122,9 +156,9 @@ jobs:
       - name: Check formatting and warnings
         run: |
           cargo fmt --all -- --check
-          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --features gui --all-targets -- -D warnings
       - name: Test minimum supported Rust version
-        run: cargo +1.89.0 test --locked --all-targets
+        run: cargo +1.89.0 test --locked --features gui --all-targets
 
   publish:
     if: startsWith(github.ref, 'refs/tags/') || inputs.publish

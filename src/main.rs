@@ -22,7 +22,7 @@ mod progress;
     name = "rustide",
     version,
     about = "Fast torrent creation, inspection, and editing",
-    long_about = "Create a torrent with: rustide <input> <output.torrent>\n\nAutomatic pieces range from 16 KiB to 16 MiB. Larger pieces require --piece-size."
+    long_about = "Open the desktop interface with: rustide gui\nCreate a torrent with: rustide <input> <output.torrent>\n\nAutomatic pieces range from 16 KiB to 16 MiB. Larger pieces require --piece-size."
 )]
 struct Cli {
     #[arg(long, global = true, value_name = "JSON")]
@@ -39,6 +39,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[cfg(feature = "gui")]
+    #[command(about = "Open the desktop interface")]
+    Gui,
     #[command(about = "Hash a file or directory and create a torrent")]
     Create(CreateArgs),
     #[command(about = "Change metadata without hashing the payload again")]
@@ -297,7 +300,7 @@ fn similar(values: &[String]) -> Result<Vec<Vec<u8>>> {
 fn normalize_args() -> Vec<OsString> {
     let mut args: Vec<_> = std::env::args_os().collect();
     let commands = [
-        "create", "edit", "info", "show", "verify", "magnet", "pad", "system", "help",
+        "create", "edit", "info", "show", "verify", "magnet", "pad", "system", "help", "gui",
     ];
     let mut index = 1;
     while let Some(value) = args.get(index).and_then(|s| s.to_str()) {
@@ -382,6 +385,10 @@ fn selected_document(
 }
 
 fn run(cli: Cli) -> Result<()> {
+    #[cfg(feature = "gui")]
+    if matches!(&cli.command, Some(Command::Gui)) {
+        return open_gui();
+    }
     if cli.checksum_algorithms {
         println!("sha1\nsha256\nsha512\nmd5");
         return Ok(());
@@ -392,6 +399,8 @@ fn run(cli: Cli) -> Result<()> {
         return Ok(());
     };
     match command {
+        #[cfg(feature = "gui")]
+        Command::Gui => return open_gui(),
         Command::Create(args) => {
             let started = Instant::now();
             let output = args.output.or(args.destination).unwrap_or_else(|| {
@@ -788,6 +797,16 @@ fn show(args: ShowArgs) -> Result<()> {
 }
 
 fn main() {
+    #[cfg(feature = "gui")]
+    if std::env::args_os().len() == 1
+        || std::env::args_os().nth(1).is_some_and(|arg| arg == "--gui")
+    {
+        if let Err(error) = open_gui() {
+            eprintln!("rustide: {}", terminal_text(&format!("{error:#}")));
+            std::process::exit(1);
+        }
+        return;
+    }
     let normalized = normalize_args();
     let positional_output =
         Cli::try_parse_from(normalized.clone())
@@ -809,6 +828,33 @@ fn main() {
         eprintln!("rustide: {}", terminal_text(&format!("{error:#}")));
         std::process::exit(1);
     }
+}
+
+#[cfg(feature = "gui")]
+fn open_gui() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // The desktop window does not need the console allocated on double-click.
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+    let result = rustide::gui::run();
+    #[cfg(target_os = "windows")]
+    if let Err(error) = &result {
+        let message: Vec<u16> = format!("Rustide could not open the desktop interface:\n{error:#}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let title: Vec<u16> = "Rustide".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+            );
+        }
+    }
+    result
 }
 
 fn terminal_text(text: &str) -> String {

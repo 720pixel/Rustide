@@ -1,6 +1,8 @@
+<img src="assets/rustide-mark.svg" alt="Rustide mark" width="64" align="right">
+
 # Rustide
 
-A fast torrent hasher and metadata editor for Linux and Windows. A single executable, with no runtime to install.
+A fast torrent creator and metadata editor for Linux and Windows. A desktop interface and command line in one portable executable, with no runtime to install.
 
 ```sh
 rustide /path/to/file-or-folder output.torrent
@@ -19,6 +21,26 @@ Get a binary from [Releases](https://github.com/720pixel/Rustide/releases).
 | Windows x86_64 | `rustide.exe`, or the Windows archive |
 
 Linux binaries include their runtime. No root access or shared-library packages are required. Windows binaries do not need a separate runtime installation.
+
+## Desktop interface
+
+Download and run the executable with no arguments to open the desktop interface. The same executable accepts every CLI command below. To open the interface from a terminal:
+
+```sh
+rustide gui
+```
+
+The Create view offers file and folder selection, automatic piece sizing, v1/v2/hybrid formats, tracker tiers, web seeds, DHT nodes, and checksums. Private is selected initially. Choose Public to enable DHT and the [public tracker preset](https://opentrackr.org/).
+
+After a successful private creation, its tracker URLs appear in the Recent trackers menu. The history is saved in your user settings and can be cleared from that menu. The progress bar shows hashing, throughput, time remaining, workers, and backends. Auto selects pieces up to 16 MiB; manual sizes up to 64 MiB are available.
+
+![Rustide desktop Create view](assets/desktop-create.png)
+
+On Windows, Browse opens the standard Explorer file and folder dialogs. **Remember locations**, beneath the output path, is off by default; when enabled, it saves the last input, output, and opened torrent folders. Turning it off clears those saved folders.
+
+The Edit view offers common metadata fields and a searchable field tree. Add, change, or remove strings, integers, lists, dictionaries, and binary values. Unknown fields are preserved, and piece hashes stay protected unless explicitly unlocked. Existing files require replacement confirmation; edits are saved atomically.
+
+Linux desktops need an X11 or XWayland display. Rendering is done in software, with no graphics driver or GUI toolkit packages to install. Windows uses its built-in desktop APIs. No installer is required.
 
 On Linux, extract the archive and run:
 
