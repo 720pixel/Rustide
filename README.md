@@ -54,6 +54,8 @@ The worker pool is chosen from available CPUs, storage type, memory, and the amo
 
 Use `--io direct`, `--io mmap`, or `--io buffered` to choose the read method explicitly. Direct reads fall back to buffered reads where needed. Keep input files unchanged while they are being hashed.
 
+Creation shows a compact progress line on stderr: percentage, hashed bytes, average throughput, and estimated time remaining. The header shows piece size, workers, and the selected hashing and read backends. Hybrid torrents show each hashing pass separately. Redirected output uses occasional plain lines; `--simple-progress` also selects this format in a terminal. Use `--quiet` to hide progress. JSON output stays silent on stderr unless `--simple-progress` is requested; binary stdout remains separate from progress.
+
 Other creation options include:
 
 - Tracker tiers and named groups, web seeds, HTTP seeds, and DHT nodes.

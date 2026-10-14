@@ -15,6 +15,8 @@ use rustide::{
     system::System,
 };
 
+mod progress;
+
 #[derive(Parser)]
 #[command(
     name = "rustide",
@@ -136,7 +138,7 @@ struct CreateArgs {
     json: bool,
     #[arg(long)]
     dry_run: bool,
-    #[arg(long)]
+    #[arg(long, help = "Print progress as plain lines, including with --json")]
     simple_progress: bool,
 }
 
@@ -453,7 +455,13 @@ fn run(cli: Cli) -> Result<()> {
                 )?;
                 return Ok(());
             }
-            let mut result = create::create(&options)?;
+            let progress_enabled = !cli.quiet && (!args.json || args.simple_progress);
+            let progress = progress::Progress::new(progress_enabled, args.simple_progress);
+            let mut result = if progress_enabled {
+                create::create_with_progress(&options, &|event| progress.update(event))?
+            } else {
+                create::create(&options)?
+            };
             if args.cross_seed {
                 let joined = options
                     .announces
@@ -476,23 +484,17 @@ fn run(cli: Cli) -> Result<()> {
                     );
             }
             metadata::validate(&metadata::from_value(result.value.clone())?)?;
+            progress.writing();
             if args.stdout {
                 binary_stdout(&result.value)?;
             } else {
                 metadata::write_atomic(&output, &result.value, args.force)?;
             }
+            drop(progress);
             result.report.total_seconds = started.elapsed().as_secs_f64();
             if args.json && !args.stdout {
                 print_json(&result.report)?;
             } else if !cli.quiet {
-                eprintln!(
-                    "{} files, {:.2} GiB, {} KiB pieces, {} workers ({})",
-                    result.report.files,
-                    result.report.payload_bytes as f64 / 1073741824.0,
-                    result.report.piece_bytes / 1024,
-                    result.report.workers,
-                    result.report.system.hash_backend
-                );
                 eprintln!(
                     "Hashed in {:.3}s ({:.2} GiB/s)",
                     result.report.hash_seconds, result.report.gib_per_second

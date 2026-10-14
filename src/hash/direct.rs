@@ -20,16 +20,38 @@ pub fn hash_v1_direct(
     workers: usize,
     batch_bytes: usize,
 ) -> Result<Vec<[u8; 20]>> {
+    hash_v1_direct_with_progress(files, piece_length, workers, batch_bytes, None)
+}
+
+pub(crate) fn hash_v1_direct_with_progress(
+    files: &[FileEntry],
+    piece_length: usize,
+    workers: usize,
+    batch_bytes: usize,
+    progress: Option<&(dyn Fn(u64) + Sync)>,
+) -> Result<Vec<[u8; 20]>> {
     #[cfg(target_os = "linux")]
     {
         if files.iter().filter(|entry| !entry.padding).count() > linux::file_budget() {
-            return super::reader::hash_v1_buffered(files, piece_length, workers, batch_bytes);
+            return super::reader::hash_v1_buffered_with_progress(
+                files,
+                piece_length,
+                workers,
+                batch_bytes,
+                progress,
+            );
         }
-        linux::hash(files, piece_length, workers, batch_bytes, true)
+        linux::hash_with_progress(files, piece_length, workers, batch_bytes, true, progress)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        super::reader::hash_v1_buffered(files, piece_length, workers, batch_bytes)
+        super::reader::hash_v1_buffered_with_progress(
+            files,
+            piece_length,
+            workers,
+            batch_bytes,
+            progress,
+        )
     }
 }
 
@@ -199,12 +221,31 @@ mod linux {
         Ok(())
     }
 
-    pub(super) fn hash(
+    #[cfg(test)]
+    fn hash(
         files: &[FileEntry],
         piece_length: usize,
         workers: usize,
         batch_bytes: usize,
         allow_direct: bool,
+    ) -> Result<Vec<[u8; 20]>> {
+        hash_with_progress(
+            files,
+            piece_length,
+            workers,
+            batch_bytes,
+            allow_direct,
+            None,
+        )
+    }
+
+    pub(super) fn hash_with_progress(
+        files: &[FileEntry],
+        piece_length: usize,
+        workers: usize,
+        batch_bytes: usize,
+        allow_direct: bool,
+        progress: Option<&(dyn Fn(u64) + Sync)>,
     ) -> Result<Vec<[u8; 20]>> {
         ensure!(
             piece_length > 0 && workers > 0,
@@ -328,6 +369,15 @@ mod linux {
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("result lock poisoned"))?;
                             result[first..first + hashes.len()].copy_from_slice(&hashes);
+                            drop(result);
+                            if let Some(progress) = progress {
+                                let bytes = crate::create::payload_bytes_in_range(
+                                    files, &ends, begin, stop,
+                                );
+                                if bytes > 0 {
+                                    progress(bytes);
+                                }
+                            }
                         }
                         Ok(())
                     })();

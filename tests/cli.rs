@@ -46,6 +46,42 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (dir, config, input)
 }
 
+fn plain_progress(output: &Output) -> &str {
+    let progress = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(!progress.contains(['\r', '\x1b']), "{progress}");
+    progress
+}
+
+fn assert_hash_progress(progress: &str, protocol: &str) {
+    let label = format!("Hashing {protocol}");
+    let lines: Vec<_> = progress
+        .lines()
+        .filter(|line| line.starts_with(&label))
+        .collect();
+    assert!(lines.len() >= 2, "missing start or completion: {progress}");
+    let percent = |line: &str| {
+        line.split_whitespace()
+            .find_map(|word| word.strip_suffix('%'))
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+    };
+    assert!(
+        lines[0].contains("0 B/")
+            && percent(lines[0])
+                == if lines[0].contains("0 B/0 B") {
+                    100.0
+                } else {
+                    0.0
+                },
+        "hashing did not start with zero completed bytes: {progress}"
+    );
+    let completed = lines.last().unwrap();
+    assert_eq!(percent(completed), 100.0, "{progress}");
+    assert!(completed.contains("/s"), "{progress}");
+    assert!(completed.contains("ETA"), "{progress}");
+}
+
 #[test]
 fn direct_creation_overwrite_and_payload_protection() {
     let (dir, config, input) = setup();
@@ -724,5 +760,205 @@ fn explicit_io_modes_match_output_and_reject_unknown_modes() {
         .status
         .success()
     );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn creation_progress_is_plain_and_covers_each_hash_pass() {
+    let (dir, config, input) = setup();
+    fs::write(&input, vec![37; 3 * rustide::merkle::BLOCK_LENGTH + 17]).unwrap();
+    for protocol in ["v1", "v2", "hybrid"] {
+        let destination = dir.path().join(format!("{protocol}.torrent"));
+        let output = success(run(
+            &config,
+            &[
+                "create",
+                input.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                "--protocol",
+                protocol,
+            ],
+        ));
+        assert!(output.stdout.is_empty());
+        let progress = plain_progress(&output);
+        let scan = progress.find("Scanning...").unwrap();
+        let hash = progress.find("Hashing ").unwrap();
+        let metadata = progress.find("Metadata...").unwrap();
+        let write = progress.find("Writing...").unwrap();
+        let done = progress.find("Written to ").unwrap();
+        assert!(scan < hash && hash < metadata && metadata < write && write < done);
+        assert!(
+            progress.contains(" | ") && progress.contains("workers"),
+            "{progress}"
+        );
+        assert!(progress.contains("Hashed in "), "{progress}");
+        if protocol != "v2" {
+            assert_hash_progress(progress, "v1");
+        } else {
+            assert!(!progress.contains("Hashing v1"));
+        }
+        if protocol != "v1" {
+            assert_hash_progress(progress, "v2");
+        } else {
+            assert!(!progress.contains("Hashing v2"));
+        }
+        let document = metadata::load(&destination).unwrap();
+        assert_eq!(
+            metadata::verify(&document, &input, Some(2)).unwrap()["valid"],
+            true
+        );
+    }
+}
+
+#[test]
+fn simple_progress_reports_checksums_and_empty_hashes() {
+    let (dir, config, input) = setup();
+    for (name, payload) in [("empty", b"".as_slice()), ("small", b"abc".as_slice())] {
+        fs::write(&input, payload).unwrap();
+        let destination = dir.path().join(format!("{name}.torrent"));
+        let output = success(run(
+            &config,
+            &[
+                "create",
+                input.to_str().unwrap(),
+                destination.to_str().unwrap(),
+                "--protocol",
+                "hybrid",
+                "--simple-progress",
+                "--checksum",
+                "sha256",
+            ],
+        ));
+        assert!(output.stdout.is_empty());
+        let progress = plain_progress(&output);
+        assert_hash_progress(progress, "v1");
+        assert_hash_progress(progress, "v2");
+        assert!(
+            progress.find("Checksums...").unwrap() < progress.find("Metadata...").unwrap(),
+            "{progress}"
+        );
+        assert!(
+            !progress.contains("NaN") && !progress.contains("inf"),
+            "{progress}"
+        );
+        let document = metadata::load(&destination).unwrap();
+        assert_eq!(
+            metadata::verify(&document, &input, Some(2)).unwrap()["valid"],
+            true
+        );
+    }
+}
+
+#[test]
+fn quiet_suppresses_progress_and_machine_output_stays_clean() {
+    let (dir, config, input) = setup();
+    for (name, flags) in [
+        ("quiet", vec!["--quiet", "--simple-progress"]),
+        ("json", vec!["--json"]),
+        ("quiet-json", vec!["--quiet", "--json", "--simple-progress"]),
+        ("progress-json", vec!["--json", "--simple-progress"]),
+    ] {
+        let destination = dir.path().join(format!("{name}.torrent"));
+        let mut args = vec![
+            "create",
+            input.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ];
+        args.extend(&flags);
+        let output = success(run(&config, &args));
+        if flags.contains(&"--json") {
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["payload_bytes"], 3);
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+        if name == "progress-json" {
+            let progress = plain_progress(&output);
+            assert!(progress.contains("Scanning...") && progress.contains("Writing..."));
+            assert_hash_progress(progress, "v1");
+        } else {
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn binary_stdout_keeps_progress_on_stderr() {
+    let (dir, config, input) = setup();
+    let destination = dir.path().join("unused.torrent");
+    for quiet in [false, true] {
+        let mut args = vec![
+            "create",
+            input.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "--protocol",
+            "hybrid",
+            "--stdout",
+        ];
+        if quiet {
+            args.push("--quiet");
+        }
+        let output = success(run(&config, &args));
+        let value = rustide::bencode::parse(&output.stdout).unwrap();
+        assert_eq!(rustide::bencode::encode(&value), output.stdout);
+        metadata::from_value(value).unwrap();
+        assert!(!destination.exists());
+        if quiet {
+            assert!(output.stderr.is_empty());
+        } else {
+            let progress = plain_progress(&output);
+            assert_hash_progress(progress, "v1");
+            assert_hash_progress(progress, "v2");
+            assert!(progress.contains("Writing..."));
+            assert!(!progress.contains("Written to "));
+        }
+    }
+}
+
+#[test]
+fn dry_run_and_scan_failure_do_not_claim_creation_completed() {
+    let (dir, config, input) = setup();
+    let destination = dir.path().join("unused.torrent");
+    let output = success(run(
+        &config,
+        &[
+            "create",
+            input.to_str().unwrap(),
+            destination.to_str().unwrap(),
+            "--dry-run",
+            "--simple-progress",
+        ],
+    ));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["payload_bytes"], 3);
+    assert!(output.stderr.is_empty());
+    assert!(!destination.exists());
+    let missing = dir.path().join("missing");
+    let output = run(
+        &config,
+        &[
+            "create",
+            missing.to_str().unwrap(),
+            destination.to_str().unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let progress = plain_progress(&output);
+    assert!(progress.contains("Scanning..."), "{progress}");
+    for success_text in [
+        "Hashing ",
+        "100%",
+        "100.0%",
+        "Writing...",
+        "Hashed in ",
+        "Written to ",
+    ] {
+        assert!(!progress.contains(success_text), "{progress}");
+    }
     assert!(!destination.exists());
 }

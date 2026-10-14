@@ -137,6 +137,35 @@ pub struct CreateResult {
     pub value: Value,
     pub report: CreateReport,
 }
+
+/// Creation phases and successful payload hashing. Callbacks may run concurrently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateProgress {
+    Scanning,
+    /// Begins a pass; hybrid creation emits v1 followed by v2 with fresh counters.
+    Hashing {
+        protocol: Protocol,
+        files: usize,
+        payload_bytes: u64,
+        piece_bytes: usize,
+        workers: usize,
+        io_backend: &'static str,
+        hash_backend: &'static str,
+    },
+    /// Payload bytes completed since the previous event, excluding padding.
+    Hashed {
+        bytes: u64,
+    },
+    Checksums,
+    Metadata,
+}
+
+#[derive(Clone, Copy)]
+struct HashProgress<'a> {
+    hashed: &'a (dyn Fn(u64) + Sync),
+    pass: &'a (dyn Fn(Protocol) + Sync),
+}
+
 pub struct HashResult {
     pub v1: Vec<[u8; 20]>,
     pub v2: Vec<merkle::FileHashes>,
@@ -370,6 +399,24 @@ fn total_length(files: &[FileEntry]) -> Result<u64> {
     })
 }
 
+pub(crate) fn payload_bytes_in_range(
+    files: &[FileEntry],
+    ends: &[u64],
+    mut begin: u64,
+    end: u64,
+) -> u64 {
+    let mut bytes = 0;
+    while begin < end {
+        let index = ends.partition_point(|&stop| stop <= begin);
+        let stop = ends[index].min(end);
+        if !files[index].padding {
+            bytes += stop - begin;
+        }
+        begin = stop;
+    }
+    bytes
+}
+
 pub fn hash_files(
     files: &[FileEntry],
     piece_length: usize,
@@ -394,6 +441,26 @@ pub fn hash_files_with_io(
     io: IoMode,
     batch_bytes: usize,
 ) -> Result<HashResult> {
+    hash_files_with_io_inner(
+        files,
+        piece_length,
+        protocol,
+        workers,
+        io,
+        batch_bytes,
+        None,
+    )
+}
+
+fn hash_files_with_io_inner(
+    files: &[FileEntry],
+    piece_length: usize,
+    protocol: Protocol,
+    workers: usize,
+    io: IoMode,
+    batch_bytes: usize,
+    progress: Option<HashProgress<'_>>,
+) -> Result<HashResult> {
     validate_piece_length(piece_length)?;
     let io = if io == IoMode::Auto {
         files
@@ -405,19 +472,32 @@ pub fn hash_files_with_io(
     } else {
         io
     };
+    if let Some(progress) = progress {
+        (progress.pass)(if protocol == Protocol::V2 {
+            Protocol::V2
+        } else {
+            Protocol::V1
+        });
+    }
     let buffered_v1 = match io {
-        IoMode::Direct if protocol != Protocol::V2 => Some(hash::direct::hash_v1_direct(
-            files,
-            piece_length,
-            workers.max(1),
-            batch_bytes,
-        )?),
-        IoMode::Buffered if protocol != Protocol::V2 => Some(hash::reader::hash_v1_buffered(
-            files,
-            piece_length,
-            workers.max(1),
-            batch_bytes,
-        )?),
+        IoMode::Direct if protocol != Protocol::V2 => {
+            Some(hash::direct::hash_v1_direct_with_progress(
+                files,
+                piece_length,
+                workers.max(1),
+                batch_bytes,
+                progress.map(|progress| progress.hashed),
+            )?)
+        }
+        IoMode::Buffered if protocol != Protocol::V2 => {
+            Some(hash::reader::hash_v1_buffered_with_progress(
+                files,
+                piece_length,
+                workers.max(1),
+                batch_bytes,
+                progress.map(|progress| progress.hashed),
+            )?)
+        }
         _ => None,
     };
     if protocol == Protocol::V1
@@ -561,6 +641,16 @@ pub fn hash_files_with_io(
                         })
                         .collect();
                     hash::sha1::hash_many_into(&pieces, output);
+                    if let Some(progress) = progress {
+                        let start = starts[0];
+                        let stop = start
+                            .saturating_add((output.len() * piece_length) as u64)
+                            .min(total);
+                        let bytes = payload_bytes_in_range(files, &ends, start, stop);
+                        if bytes > 0 {
+                            (progress.hashed)(bytes);
+                        }
+                    }
                     Ok(())
                 },
             )?;
@@ -569,6 +659,11 @@ pub fn hash_files_with_io(
             Vec::new()
         };
         let v2 = if protocol != Protocol::V1 {
+            if protocol == Protocol::Hybrid
+                && let Some(progress) = progress
+            {
+                (progress.pass)(Protocol::V2);
+            }
             files
                 .par_iter()
                 .enumerate()
@@ -580,11 +675,16 @@ pub fn hash_files_with_io(
                         });
                     }
                     match &shared_maps {
-                        Some(maps) => Ok(merkle::hash_file(
+                        Some(maps) => Ok(merkle::hash_file_with_progress(
                             maps[index].as_ref().unwrap(),
                             piece_length,
+                            progress.map(|progress| progress.hashed),
                         )),
-                        None => Ok(merkle::hash_file(&map_file(file)?, piece_length)),
+                        None => Ok(merkle::hash_file_with_progress(
+                            &map_file(file)?,
+                            piece_length,
+                            progress.map(|progress| progress.hashed),
+                        )),
                     }
                 })
                 .collect::<Result<Vec<_>>>()?
@@ -644,8 +744,27 @@ pub fn parse_node(text: &str) -> Result<Value> {
 }
 
 pub fn create(options: &CreateOptions) -> Result<CreateResult> {
+    create_inner(options, None)
+}
+
+/// Create metainfo with phase updates and payload progress from completed pieces.
+/// The callback should be lightweight and may run on hashing worker threads.
+pub fn create_with_progress(
+    options: &CreateOptions,
+    progress: &(dyn Fn(CreateProgress) + Sync),
+) -> Result<CreateResult> {
+    create_inner(options, Some(progress))
+}
+
+fn create_inner(
+    options: &CreateOptions,
+    progress: Option<&(dyn Fn(CreateProgress) + Sync)>,
+) -> Result<CreateResult> {
     let started = Instant::now();
     validate_options(options)?;
+    if let Some(progress) = progress {
+        progress(CreateProgress::Scanning);
+    }
     let original = scan(options)?;
     let snapshots: Vec<_> = original
         .iter()
@@ -695,13 +814,39 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
         });
     let hashing = Instant::now();
     let batch_bytes = reader_batch_size(&system, workers, piece_length);
-    let hashes = hash_files_with_io(
+    let hashed = |bytes| {
+        if let Some(progress) = progress {
+            progress(CreateProgress::Hashed { bytes });
+        }
+    };
+    let pass = |protocol| {
+        if let Some(progress) = progress {
+            progress(CreateProgress::Hashing {
+                protocol,
+                files: original.len(),
+                payload_bytes,
+                piece_bytes: piece_length,
+                workers,
+                io_backend: io_backend(io, protocol),
+                hash_backend: if protocol == Protocol::V2 {
+                    "sha256"
+                } else {
+                    hash::backend()
+                },
+            });
+        }
+    };
+    let hashes = hash_files_with_io_inner(
         &files,
         piece_length,
         options.protocol,
         workers,
         io,
         batch_bytes,
+        progress.map(|_| HashProgress {
+            hashed: &hashed,
+            pass: &pass,
+        }),
     )?;
     let hash_seconds = hashing.elapsed().as_secs_f64();
     let single = options.target.is_file();
@@ -735,6 +880,9 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
     }
     let mut checksum_values = BTreeMap::<usize, BTreeMap<Vec<u8>, Value>>::new();
     if !options.checksums.is_empty() {
+        if let Some(progress) = progress {
+            progress(CreateProgress::Checksums);
+        }
         for (index, file) in files.iter().enumerate().filter(|(_, f)| !f.padding) {
             let mapping = if file.length > 0 {
                 Some(map_file(file)?)
@@ -756,6 +904,9 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
             }
             checksum_values.insert(index, values);
         }
+    }
+    if let Some(progress) = progress {
+        progress(CreateProgress::Metadata);
     }
     if options.protocol != Protocol::V2 {
         info.insert(
@@ -894,18 +1045,7 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
             payload_bytes,
             piece_bytes: piece_length,
             workers,
-            io_backend: if io == IoMode::Direct
-                && options.protocol != Protocol::V2
-                && cfg!(target_os = "linux")
-            {
-                "direct"
-            } else if matches!(io, IoMode::Buffered | IoMode::Direct)
-                && options.protocol != Protocol::V2
-            {
-                "buffered"
-            } else {
-                "mmap"
-            },
+            io_backend: io_backend(io, options.protocol),
             hash_seconds,
             total_seconds: started.elapsed().as_secs_f64(),
             gib_per_second: if hash_seconds > 0.0 {
@@ -916,6 +1056,16 @@ pub fn create(options: &CreateOptions) -> Result<CreateResult> {
             system,
         },
     })
+}
+
+fn io_backend(io: IoMode, protocol: Protocol) -> &'static str {
+    if io == IoMode::Direct && protocol != Protocol::V2 && cfg!(target_os = "linux") {
+        "direct"
+    } else if matches!(io, IoMode::Buffered | IoMode::Direct) && protocol != Protocol::V2 {
+        "buffered"
+    } else {
+        "mmap"
+    }
 }
 
 pub(crate) fn automatic_io(system: &System, protocol: Protocol) -> IoMode {
@@ -944,6 +1094,229 @@ pub(crate) fn reader_batch_size(system: &System, workers: usize, piece_length: u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    fn reference_tree(data: &[u8], leaves: usize) -> merkle::Hash {
+        let mut hashes: Vec<merkle::Hash> = data
+            .chunks(merkle::BLOCK_LENGTH)
+            .map(|block| sha2::Sha256::digest(block).into())
+            .collect();
+        hashes.resize(leaves, [0; 32]);
+        while hashes.len() > 1 {
+            hashes = hashes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| {
+                    let bytes: Vec<_> = pair.iter().flatten().copied().collect();
+                    sha2::Sha256::digest(bytes).into()
+                })
+                .collect();
+        }
+        hashes[0]
+    }
+
+    fn reference_file(data: &[u8], piece: usize) -> merkle::FileHashes {
+        merkle::FileHashes {
+            root: if data.is_empty() {
+                None
+            } else {
+                Some(reference_tree(
+                    data,
+                    data.len()
+                        .div_ceil(merkle::BLOCK_LENGTH)
+                        .next_power_of_two(),
+                ))
+            },
+            piece_layer: if data.len() > piece {
+                data.chunks(piece)
+                    .map(|bytes| reference_tree(bytes, piece / merkle::BLOCK_LENGTH))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    #[test]
+    fn hashing_progress_counts_payload_and_preserves_reference_hashes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        let mut stream = Vec::new();
+        let mut expected_v2 = Vec::new();
+        let mut payload = 0;
+        for (index, length) in [0, MIN_PIECE - 1, 19 * MIN_PIECE + 17, 1]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes: Vec<_> = (0..length)
+                .map(|n| ((n * 37 + index) % 251) as u8)
+                .collect();
+            let disk_path = directory.path().join(index.to_string());
+            fs::write(&disk_path, &bytes).unwrap();
+            files.push(FileEntry {
+                disk_path,
+                components: vec![index.to_string().into_bytes()],
+                length: length as u64,
+                padding: false,
+            });
+            payload += length as u64;
+            stream.extend_from_slice(&bytes);
+            expected_v2.push(reference_file(&bytes, MIN_PIECE));
+            if index == 1 {
+                let padding = 17 * MIN_PIECE + 5;
+                files.push(FileEntry {
+                    disk_path: PathBuf::new(),
+                    components: vec![b"padding".to_vec()],
+                    length: padding as u64,
+                    padding: true,
+                });
+                stream.resize(stream.len() + padding, 0);
+                expected_v2.push(reference_file(&[], MIN_PIECE));
+            }
+        }
+        let expected_v1: Vec<[u8; 20]> = stream
+            .chunks(MIN_PIECE)
+            .map(|bytes| sha1::Sha1::digest(bytes).into())
+            .collect();
+        for io in [IoMode::Mmap, IoMode::Buffered, IoMode::Direct] {
+            for protocol in [Protocol::V1, Protocol::V2, Protocol::Hybrid] {
+                let passes = Mutex::new(Vec::<(Protocol, u64, usize)>::new());
+                let pass = |protocol| passes.lock().unwrap().push((protocol, 0, 0));
+                let hashed = |bytes| {
+                    assert!(bytes > 0);
+                    let mut passes = passes.lock().unwrap();
+                    let active = passes.last_mut().expect("hashing phase before bytes");
+                    active.1 += bytes;
+                    active.2 += 1;
+                    assert!(active.1 <= payload);
+                    if active.0 == Protocol::V2 {
+                        assert!(bytes <= MIN_PIECE as u64);
+                    }
+                };
+                let result = hash_files_with_io_inner(
+                    &files,
+                    MIN_PIECE,
+                    protocol,
+                    3,
+                    io,
+                    3 * MIN_PIECE,
+                    Some(HashProgress {
+                        hashed: &hashed,
+                        pass: &pass,
+                    }),
+                )
+                .unwrap();
+                assert_eq!(
+                    result.v1,
+                    if protocol == Protocol::V2 {
+                        Vec::new()
+                    } else {
+                        expected_v1.clone()
+                    }
+                );
+                assert_eq!(
+                    result.v2,
+                    if protocol == Protocol::V1 {
+                        Vec::new()
+                    } else {
+                        expected_v2.clone()
+                    }
+                );
+                let passes = passes.into_inner().unwrap();
+                let protocols: Vec<_> = passes.iter().map(|pass| pass.0).collect();
+                assert_eq!(
+                    protocols,
+                    match protocol {
+                        Protocol::V1 => vec![Protocol::V1],
+                        Protocol::V2 => vec![Protocol::V2],
+                        Protocol::Hybrid => vec![Protocol::V1, Protocol::V2],
+                    }
+                );
+                for (_, bytes, events) in passes {
+                    assert_eq!(bytes, payload);
+                    assert!(events > 1, "progress must update during the pass");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn creation_progress_covers_empty_single_directory_and_checksum_phases() {
+        let temporary = tempfile::tempdir().unwrap();
+        let empty = temporary.path().join("empty");
+        let single = temporary.path().join("single");
+        let directory = temporary.path().join("directory");
+        fs::write(&empty, []).unwrap();
+        fs::write(&single, b"abc").unwrap();
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("a"), b"abc").unwrap();
+        fs::write(directory.join("b"), vec![7; MIN_PIECE + 19]).unwrap();
+        fs::write(directory.join("empty"), []).unwrap();
+        for (target, payload) in [(empty, 0), (single, 3), (directory, MIN_PIECE as u64 + 22)] {
+            for protocol in [Protocol::V1, Protocol::V2, Protocol::Hybrid] {
+                let options = CreateOptions {
+                    target: target.clone(),
+                    protocol,
+                    piece_length: Some(MIN_PIECE),
+                    threads: Some(2),
+                    io: IoMode::Buffered,
+                    checksums: vec!["sha256".into()],
+                    no_creation_date: true,
+                    ..Default::default()
+                };
+                let events = Mutex::new(Vec::new());
+                let result = create_with_progress(&options, &|event| {
+                    events.lock().unwrap().push(event);
+                })
+                .unwrap();
+                assert_eq!(result.value, create(&options).unwrap().value);
+                let events = events.into_inner().unwrap();
+                assert_eq!(events.first(), Some(&CreateProgress::Scanning));
+                assert_eq!(events.last(), Some(&CreateProgress::Metadata));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| **event == CreateProgress::Checksums)
+                        .count(),
+                    1
+                );
+                let mut totals = Vec::<u64>::new();
+                for event in events {
+                    match event {
+                        CreateProgress::Hashing {
+                            payload_bytes,
+                            io_backend,
+                            protocol,
+                            ..
+                        } => {
+                            assert_eq!(payload_bytes, payload);
+                            assert_eq!(
+                                io_backend,
+                                if protocol == Protocol::V2 {
+                                    "mmap"
+                                } else {
+                                    "buffered"
+                                }
+                            );
+                            totals.push(0);
+                        }
+                        CreateProgress::Hashed { bytes } => *totals.last_mut().unwrap() += bytes,
+                        _ => {}
+                    }
+                }
+                assert_eq!(
+                    totals,
+                    vec![payload; if protocol == Protocol::Hybrid { 2 } else { 1 }]
+                );
+                let document = crate::metadata::from_value(result.value).unwrap();
+                assert_eq!(
+                    crate::metadata::verify(&document, &options.target, Some(2)).unwrap()["valid"],
+                    true
+                );
+            }
+        }
+    }
 
     #[test]
     fn piece_policy_matches_integer_boundaries() {

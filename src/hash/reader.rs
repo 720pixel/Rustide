@@ -15,11 +15,13 @@ use crate::create::FileEntry;
 struct Job {
     first_piece: usize,
     used: usize,
+    payload_bytes: u64,
     buffer: Vec<u8>,
 }
 
 struct Completed {
     first_piece: usize,
+    payload_bytes: u64,
     hashes: Result<Vec<[u8; 20]>>,
     buffer: Vec<u8>,
 }
@@ -41,6 +43,16 @@ pub fn hash_v1_buffered(
     piece_length: usize,
     workers: usize,
     batch_bytes: usize,
+) -> Result<Vec<[u8; 20]>> {
+    hash_v1_buffered_with_progress(files, piece_length, workers, batch_bytes, None)
+}
+
+pub(crate) fn hash_v1_buffered_with_progress(
+    files: &[FileEntry],
+    piece_length: usize,
+    workers: usize,
+    batch_bytes: usize,
+    progress: Option<&(dyn Fn(u64) + Sync)>,
 ) -> Result<Vec<[u8; 20]>> {
     ensure!(piece_length > 0, "piece length must be greater than zero");
     ensure!(workers > 0, "worker count must be greater than zero");
@@ -107,7 +119,7 @@ pub fn hash_v1_buffered(
                     allocated += 1;
                     buffer
                 } else {
-                    let buffer = collect(&completed_rx, &mut output)?;
+                    let buffer = collect(&completed_rx, &mut output, progress)?;
                     pending -= 1;
                     buffer
                 };
@@ -120,6 +132,7 @@ pub fn hash_v1_buffered(
                     .send(Job {
                         first_piece,
                         used,
+                        payload_bytes: reader.payload_bytes,
                         buffer,
                     })
                     .map_err(|_| anyhow!("piece hashing workers stopped unexpectedly"))?;
@@ -127,7 +140,7 @@ pub fn hash_v1_buffered(
                 first_piece += pieces;
             }
             while pending > 0 {
-                collect(&completed_rx, &mut output)?;
+                collect(&completed_rx, &mut output, progress)?;
                 pending -= 1;
             }
             ensure!(first_piece == piece_count, "input piece count changed");
@@ -168,6 +181,7 @@ fn worker(
         if completed
             .send(Completed {
                 first_piece: job.first_piece,
+                payload_bytes: job.payload_bytes,
                 hashes,
                 buffer: job.buffer,
             })
@@ -179,7 +193,11 @@ fn worker(
     }
 }
 
-fn collect(completed: &mpsc::Receiver<Completed>, output: &mut [[u8; 20]]) -> Result<Vec<u8>> {
+fn collect(
+    completed: &mpsc::Receiver<Completed>,
+    output: &mut [[u8; 20]],
+    progress: Option<&(dyn Fn(u64) + Sync)>,
+) -> Result<Vec<u8>> {
     let completed = completed
         .recv()
         .context("piece hashing workers stopped before completing their jobs")?;
@@ -192,6 +210,11 @@ fn collect(completed: &mpsc::Receiver<Completed>, output: &mut [[u8; 20]]) -> Re
         .get_mut(completed.first_piece..end)
         .context("piece result exceeds the expected output")?;
     destination.copy_from_slice(&hashes);
+    if completed.payload_bytes > 0
+        && let Some(progress) = progress
+    {
+        progress(completed.payload_bytes);
+    }
     Ok(completed.buffer)
 }
 
@@ -201,6 +224,7 @@ struct SequentialReader<'a> {
     initialized: bool,
     file: Option<File>,
     remaining: u64,
+    payload_bytes: u64,
 }
 
 impl<'a> SequentialReader<'a> {
@@ -211,11 +235,13 @@ impl<'a> SequentialReader<'a> {
             initialized: false,
             file: None,
             remaining: 0,
+            payload_bytes: 0,
         }
     }
 
     fn fill(&mut self, buffer: &mut [u8]) -> Result<usize> {
         let mut written = 0;
+        self.payload_bytes = 0;
         while written < buffer.len() && self.index < self.entries.len() {
             let entry = &self.entries[self.index];
             if !self.initialized {
@@ -277,6 +303,7 @@ impl<'a> SequentialReader<'a> {
             if let Some(file) = self.file.as_mut() {
                 file.read_exact(destination)
                     .with_context(|| format!("read {}", entry.disk_path.display()))?;
+                self.payload_bytes += count as u64;
             } else {
                 destination.fill(0);
             }

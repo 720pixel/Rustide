@@ -13,6 +13,14 @@ pub struct FileHashes {
 /// Hash a file using BEP 52's 16 KiB leaves and zero-hash padding.
 /// The piece length must be a power of two of at least 16 KiB.
 pub fn hash_file(data: &[u8], piece_length: usize) -> FileHashes {
+    hash_file_with_progress(data, piece_length, None)
+}
+
+pub(crate) fn hash_file_with_progress(
+    data: &[u8],
+    piece_length: usize,
+    progress: Option<&(dyn Fn(u64) + Sync)>,
+) -> FileHashes {
     validate_piece_length(piece_length);
     if data.is_empty() {
         return FileHashes {
@@ -22,15 +30,29 @@ pub fn hash_file(data: &[u8], piece_length: usize) -> FileHashes {
     }
     if data.len() <= piece_length {
         let blocks = data.len().div_ceil(BLOCK_LENGTH).next_power_of_two();
+        let root = piece_root(data, blocks * BLOCK_LENGTH);
+        if let Some(progress) = progress {
+            progress(data.len() as u64);
+        }
         return FileHashes {
-            root: Some(piece_root(data, blocks * BLOCK_LENGTH)),
+            root: Some(root),
             piece_layer: Vec::new(),
         };
     }
-    let piece_layer: Vec<Hash> = data
-        .par_chunks(piece_length)
-        .map(|piece| piece_root(piece, piece_length))
-        .collect();
+    let piece_layer: Vec<Hash> = match progress {
+        Some(progress) => data
+            .par_chunks(piece_length)
+            .map(|piece| {
+                let root = piece_root(piece, piece_length);
+                progress(piece.len() as u64);
+                root
+            })
+            .collect(),
+        None => data
+            .par_chunks(piece_length)
+            .map(|piece| piece_root(piece, piece_length))
+            .collect(),
+    };
     let base_level = (piece_length / BLOCK_LENGTH).trailing_zeros() as usize;
     FileHashes {
         root: Some(combine_root(&piece_layer, base_level)),
@@ -150,6 +172,34 @@ mod tests {
                 .collect();
         }
         Some(leaves[0])
+    }
+
+    #[test]
+    fn progress_reports_completed_pieces_including_short_final_data() {
+        use std::sync::Mutex;
+        let piece_length = BLOCK_LENGTH * 2;
+        for length in [0, 1, BLOCK_LENGTH - 1, piece_length, piece_length * 19 + 17] {
+            let data: Vec<_> = (0..length).map(|n| (n % 251) as u8).collect();
+            let completed = Mutex::new(Vec::new());
+            let output = hash_file_with_progress(
+                &data,
+                piece_length,
+                Some(&|bytes| {
+                    completed.lock().unwrap().push(bytes);
+                }),
+            );
+            assert_eq!(output.root, reference(&data));
+            assert_eq!(output, hash_file(&data, piece_length));
+            let mut actual = completed.into_inner().unwrap();
+            let mut expected: Vec<_> = data
+                .chunks(piece_length)
+                .map(|piece| piece.len() as u64)
+                .collect();
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.iter().sum::<u64>(), length as u64);
+        }
     }
 
     #[test]
