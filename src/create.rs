@@ -429,7 +429,7 @@ pub fn hash_files(
         protocol,
         workers,
         IoMode::Auto,
-        piece_length.saturating_mul(16),
+        piece_length.saturating_mul(hash::sha1::preferred_batch_pieces()),
     )
 }
 
@@ -808,7 +808,7 @@ fn create_inner(
             piece_length,
         )
         .min(if io == IoMode::Direct && options.threads.is_none() {
-            8
+            if original.len() > 1 { 16 } else { 8 }
         } else {
             usize::MAX
         });
@@ -1083,7 +1083,7 @@ pub(crate) fn automatic_io(system: &System, protocol: Protocol) -> IoMode {
 
 pub(crate) fn reader_batch_size(system: &System, workers: usize, piece_length: usize) -> usize {
     piece_length
-        .saturating_mul(16)
+        .saturating_mul(hash::sha1::preferred_batch_pieces())
         .min(
             (system.available_memory_bytes / 4 / (workers as u64 + 1)).min(usize::MAX as u64)
                 as usize,

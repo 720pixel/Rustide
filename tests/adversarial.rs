@@ -399,3 +399,82 @@ fn io_modes_match_across_file_and_piece_boundaries() {
         }
     }
 }
+
+#[test]
+fn direct_reads_many_files_with_padding_and_short_batches() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    let mut stream = Vec::new();
+    let mut roots = Vec::new();
+    for index in 0..321 {
+        let length = [
+            0,
+            1,
+            BLOCK_LENGTH - 1,
+            BLOCK_LENGTH,
+            BLOCK_LENGTH + 1,
+            4 * BLOCK_LENGTH + 7,
+        ][index % 6];
+        let data: Vec<_> = (0..length)
+            .map(|offset| ((offset * 29 + index * 7) % 251) as u8)
+            .collect();
+        let name = format!("{index:03}.bin");
+        let disk_path = temp.path().join(&name);
+        fs::write(&disk_path, &data).unwrap();
+        files.push(create::FileEntry {
+            disk_path,
+            components: vec![name.into_bytes()],
+            length: length as u64,
+            padding: false,
+        });
+        stream.extend_from_slice(&data);
+        roots.push(reference_root(&data));
+        if index % 23 == 0 {
+            let padding = BLOCK_LENGTH + index + 3;
+            files.push(create::FileEntry {
+                disk_path: temp.path().join("absent-padding-file"),
+                components: vec![b".pad".to_vec(), index.to_string().into_bytes()],
+                length: padding as u64,
+                padding: true,
+            });
+            stream.resize(stream.len() + padding, 0);
+            roots.push(None);
+        }
+    }
+    let expected: Vec<[u8; 20]> = stream
+        .chunks(BLOCK_LENGTH)
+        .map(|piece| Sha1::digest(piece).into())
+        .collect();
+    assert_ne!(stream.len() % BLOCK_LENGTH, 0);
+    for workers in [1, 7] {
+        for batch_pieces in [1, 3, 16] {
+            let hashes = create::hash_files_with_io(
+                &files,
+                BLOCK_LENGTH,
+                Protocol::V1,
+                workers,
+                create::IoMode::Direct,
+                batch_pieces * BLOCK_LENGTH,
+            )
+            .unwrap();
+            assert_eq!(
+                hashes.v1, expected,
+                "workers={workers}, batch_pieces={batch_pieces}"
+            );
+        }
+    }
+    let hybrid = create::hash_files_with_io(
+        &files,
+        BLOCK_LENGTH,
+        Protocol::Hybrid,
+        7,
+        create::IoMode::Direct,
+        3 * BLOCK_LENGTH,
+    )
+    .unwrap();
+    assert_eq!(hybrid.v1, expected);
+    assert_eq!(
+        hybrid.v2.iter().map(|file| file.root).collect::<Vec<_>>(),
+        roots
+    );
+}

@@ -12,6 +12,17 @@ pub fn hash(bytes: &[u8]) -> [u8; 20] {
     Sha1::digest(bytes).into()
 }
 
+pub(crate) fn preferred_batch_pieces() -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("avx512f")
+        && std::is_x86_feature_detected!("avx512vl")
+    {
+        return 8;
+    }
+    16
+}
+
 /// Compute independent SHA-1 digests in input order.
 ///
 /// Runtime feature detection keeps the same binary portable across CPUs. Long,
@@ -52,13 +63,17 @@ pub fn hash_many_into(pieces: &[&[u8]], output: &mut [[u8; 20]]) {
                 }
             }
             if std::is_x86_feature_detected!("avx2") {
+                let use_vl = std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512vl");
                 while end - index >= 8 {
                     // Detection above establishes every feature used by this kernel.
                     unsafe {
-                        x86::narrow::hash_batch(
-                            pieces[index..index + 8].try_into().unwrap(),
-                            &mut output[index..index + 8],
-                        );
+                        let batch = pieces[index..index + 8].try_into().unwrap();
+                        if use_vl {
+                            x86::narrow_vl::hash_batch(batch, &mut output[index..index + 8]);
+                        } else {
+                            x86::narrow::hash_batch(batch, &mut output[index..index + 8]);
+                        }
                     }
                     index += 8;
                 }
@@ -244,12 +259,12 @@ mod x86 {
 
         #[inline]
         #[target_feature(enable = "avx2")]
-        fn add(a: __m256i, b: __m256i) -> __m256i {
+        pub(super) fn add(a: __m256i, b: __m256i) -> __m256i {
             _mm256_add_epi32(a, b)
         }
         #[inline]
         #[target_feature(enable = "avx2")]
-        fn xor(a: __m256i, b: __m256i) -> __m256i {
+        pub(super) fn xor(a: __m256i, b: __m256i) -> __m256i {
             _mm256_xor_si256(a, b)
         }
         #[inline]
@@ -282,7 +297,7 @@ mod x86 {
 
         #[inline]
         #[target_feature(enable = "avx2")]
-        unsafe fn load_words(pointers: &[*const u8; 8], offset: usize) -> [__m256i; 16] {
+        pub(super) unsafe fn load_words(pointers: &[*const u8; 8], offset: usize) -> [__m256i; 16] {
             unsafe {
                 let mut words = [_mm256_setzero_si256(); 16];
                 let byte_swap = _mm256_broadcastsi128_si256(_mm_setr_epi32(
@@ -321,6 +336,40 @@ mod x86 {
             }
         }
         kernel!(8, "avx2", __m256i, _mm256_set1_epi32, _mm256_storeu_si256);
+    }
+
+    pub(super) mod narrow_vl {
+        use super::narrow::{add, load_words, xor};
+        use super::*;
+
+        #[inline]
+        #[target_feature(enable = "avx2,avx512f,avx512vl")]
+        fn rotate<const N: i32>(a: __m256i) -> __m256i {
+            _mm256_rol_epi32::<N>(a)
+        }
+        #[inline]
+        #[target_feature(enable = "avx2,avx512f,avx512vl")]
+        fn choose(b: __m256i, c: __m256i, d: __m256i) -> __m256i {
+            _mm256_ternarylogic_epi32::<0xca>(b, c, d)
+        }
+        #[inline]
+        #[target_feature(enable = "avx2,avx512f,avx512vl")]
+        fn parity(b: __m256i, c: __m256i, d: __m256i) -> __m256i {
+            _mm256_ternarylogic_epi32::<0x96>(b, c, d)
+        }
+        #[inline]
+        #[target_feature(enable = "avx2,avx512f,avx512vl")]
+        fn majority(b: __m256i, c: __m256i, d: __m256i) -> __m256i {
+            _mm256_ternarylogic_epi32::<0xe8>(b, c, d)
+        }
+
+        kernel!(
+            8,
+            "avx2,avx512f,avx512vl",
+            __m256i,
+            _mm256_set1_epi32,
+            _mm256_storeu_si256
+        );
     }
 
     pub(super) mod wide {
@@ -428,10 +477,15 @@ mod tests {
         ] {
             assert_eq!(hex(hash(message.as_bytes())), expected);
         }
-        assert_eq!(
-            hex(hash(&vec![b'a'; 1_000_000])),
-            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
-        );
+        let million_a = vec![b'a'; 1_000_000];
+        let expected = "34aa973cd4c4daa4f61eeb2bdbad27316534016f";
+        assert_eq!(hex(hash(&million_a)), expected);
+        for count in [8, 16] {
+            let pieces = vec![million_a.as_slice(); count];
+            for digest in hash_many(&pieces) {
+                assert_eq!(hex(digest), expected);
+            }
+        }
     }
 
     fn messages(count: usize, length: usize) -> Vec<Vec<u8>> {
@@ -483,6 +537,18 @@ mod tests {
                     x86::narrow::hash_batch(refs[..8].try_into().unwrap(), &mut actual);
                 }
                 assert_eq!(actual.as_slice(), &expected[..8], "AVX2 length {length}");
+                if std::is_x86_feature_detected!("avx512f")
+                    && std::is_x86_feature_detected!("avx512vl")
+                {
+                    unsafe {
+                        x86::narrow_vl::hash_batch(refs[..8].try_into().unwrap(), &mut actual);
+                    }
+                    assert_eq!(
+                        actual.as_slice(),
+                        &expected[..8],
+                        "AVX512VL length {length}"
+                    );
+                }
             }
             if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw")
             {

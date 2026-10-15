@@ -74,7 +74,7 @@ Sizes also accept bytes and power-of-two exponents: `--piece-size 24` means 16 M
 
 The worker pool is chosen from available CPUs, storage type, memory, and the amount of work. Override it with `--threads 16`. More workers can add overhead once storage throughput is saturated.
 
-Use `--io direct`, `--io mmap`, or `--io buffered` to choose the read method explicitly. Direct reads fall back to buffered reads where needed. Keep input files unchanged while they are being hashed.
+Use `--io direct`, `--io mmap`, or `--io buffered` to choose the read method explicitly. Direct reads use bounded file handles for large directories and support pieces that cross files, falling back to buffered reads where needed. Keep input files unchanged while they are being hashed.
 
 Creation shows a compact progress line on stderr: percentage, hashed bytes, average throughput, and estimated time remaining. The header shows piece size, workers, and the selected hashing and read backends. Hybrid torrents show each hashing pass separately. Redirected output uses occasional plain lines; `--simple-progress` also selects this format in a terminal. Use `--quiet` to hide progress. JSON output stays silent on stderr unless `--simple-progress` is requested; binary stdout remains separate from progress.
 

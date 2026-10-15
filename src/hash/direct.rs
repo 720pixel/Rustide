@@ -6,13 +6,15 @@ use anyhow::Result;
 /// Hash concatenated v1 payloads in piece order, including synthesized padding.
 ///
 /// `batch_bytes` rounds down to whole pieces, with a minimum of one piece.
-/// In the Linux fast path, each worker owns one buffer capped at total length, plus
-/// less than 8 KiB of alignment slack. At most `min(workers, batches)` buffers
-/// are allocated; digest output and file descriptors require additional memory.
-/// Linux uses direct reads for batches contained in one file and ordinary reads
-/// for cross-file batches or unsupported filesystems. Inputs exceeding the
-/// process descriptor budget or 256 real files, and other platforms, use the
-/// sequential reader; that fallback can require one additional reader buffer.
+/// In the Linux fast path, each worker owns one buffer capped at total length,
+/// plus at most 12.5% and less than 12 KiB of alignment slack. Only pieces crossing
+/// gaps in that buffer are copied, requiring at most one additional batch payload
+/// per worker. At most `min(workers, batches)` workers allocate buffers; digest
+/// output, segment records, piece references, and descriptors use additional memory.
+/// Linux uses direct reads for file ranges and ordinary reads for small ranges
+/// or unsupported filesystems. Each worker holds at most two input descriptors,
+/// so large directories do not require a sequential fallback. Other platforms
+/// use the sequential reader, which can require one additional reader buffer.
 /// Payloads must remain stable while hashing.
 pub fn hash_v1_direct(
     files: &[FileEntry],
@@ -32,7 +34,8 @@ pub(crate) fn hash_v1_direct_with_progress(
 ) -> Result<Vec<[u8; 20]>> {
     #[cfg(target_os = "linux")]
     {
-        if files.iter().filter(|entry| !entry.padding).count() > linux::file_budget() {
+        let budget = linux::file_budget();
+        if budget == 0 {
             return super::reader::hash_v1_buffered_with_progress(
                 files,
                 piece_length,
@@ -41,7 +44,14 @@ pub(crate) fn hash_v1_direct_with_progress(
                 progress,
             );
         }
-        linux::hash_with_progress(files, piece_length, workers, batch_bytes, true, progress)
+        linux::hash_with_progress(
+            files,
+            piece_length,
+            workers.min(budget),
+            batch_bytes,
+            true,
+            progress,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -73,6 +83,103 @@ mod linux {
     use rayon::prelude::*;
 
     const ALIGN: usize = 4096;
+    const DIRECT_MIN: usize = 64 * 1024;
+
+    #[derive(Clone, Copy)]
+    struct Segment {
+        logical_start: usize,
+        physical_start: usize,
+        length: usize,
+    }
+
+    fn push_segment(segments: &mut Vec<Segment>, segment: Segment) {
+        if let Some(previous) = segments.last_mut()
+            && previous.logical_start + previous.length == segment.logical_start
+            && previous.physical_start + previous.length == segment.physical_start
+        {
+            previous.length += segment.length;
+        } else {
+            segments.push(segment);
+        }
+    }
+
+    fn buffer_length(effective_batch: usize, direct_files: usize) -> Result<usize> {
+        let slack = (effective_batch / DIRECT_MIN)
+            .min(direct_files)
+            .checked_add(1)
+            .and_then(|fragments| fragments.checked_mul(2 * ALIGN))
+            .context("alignment slack overflow")?;
+        let rounded = effective_batch
+            .checked_add(slack)
+            .and_then(|bytes| bytes.checked_add(ALIGN - 1))
+            .context("buffer length overflow")?
+            / ALIGN
+            * ALIGN;
+        Ok(rounded)
+    }
+
+    fn hash_segments(
+        buffer: &[u8],
+        segments: &[Segment],
+        used: usize,
+        piece_length: usize,
+        scratch: &mut Vec<Vec<u8>>,
+    ) -> Vec<[u8; 20]> {
+        if segments.len() == 1 {
+            let start = segments[0].physical_start;
+            let pieces: Vec<_> = buffer[start..start + used].chunks(piece_length).collect();
+            return sha1::hash_many(&pieces);
+        }
+
+        let mut owned = Vec::<Option<usize>>::with_capacity(used.div_ceil(piece_length));
+        let mut locations = Vec::with_capacity(owned.capacity());
+        let mut index = 0;
+        let mut copied = 0;
+        for begin in (0..used).step_by(piece_length) {
+            let length = piece_length.min(used - begin);
+            let end = begin + length;
+            while segments[index].logical_start + segments[index].length <= begin {
+                index += 1;
+            }
+            let segment = segments[index];
+            let physical = segment.physical_start + begin - segment.logical_start;
+            locations.push((physical, length));
+            if end <= segment.logical_start + segment.length {
+                owned.push(None);
+                continue;
+            }
+
+            if copied == scratch.len() {
+                scratch.push(Vec::with_capacity(length));
+            }
+            let piece = &mut scratch[copied];
+            piece.clear();
+            let mut position = begin;
+            let mut part = index;
+            while position < end {
+                let segment = segments[part];
+                let offset = position - segment.logical_start;
+                let count = (segment.length - offset).min(end - position);
+                let start = segment.physical_start + offset;
+                piece.extend_from_slice(&buffer[start..start + count]);
+                position += count;
+                part += 1;
+            }
+            owned.push(Some(copied));
+            copied += 1;
+        }
+        // Finish allocating boundary pieces before borrowing any owned payload.
+        let pieces: Vec<_> = owned
+            .iter()
+            .zip(locations)
+            .map(|(piece, (start, length))| {
+                piece
+                    .map(|index| scratch[index].as_slice())
+                    .unwrap_or_else(|| &buffer[start..start + length])
+            })
+            .collect();
+        sha1::hash_many(&pieces)
+    }
 
     fn descriptor_budget(soft_limit: libc::rlim_t) -> usize {
         // Each input may hold two descriptors. Reserve room for the caller,
@@ -125,6 +232,46 @@ mod linux {
         direct: Option<File>,
         direct_disabled: AtomicBool,
         length: u64,
+    }
+
+    impl Input {
+        fn validate(&self) -> Result<()> {
+            if let Some(file) = &self.regular {
+                ensure!(
+                    file.metadata()?.len() == self.length,
+                    "input length changed while hashing"
+                );
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct InputCache {
+        current: Option<(usize, Input)>,
+    }
+
+    impl InputCache {
+        fn get(&mut self, index: usize, files: &[FileEntry], allow_direct: bool) -> Result<&Input> {
+            if self
+                .current
+                .as_ref()
+                .is_none_or(|(cached, _)| *cached != index)
+            {
+                if let Some((_, previous)) = self.current.take() {
+                    previous.validate()?;
+                }
+                self.current = Some((index, open_input(&files[index], allow_direct)?));
+            }
+            Ok(&self.current.as_ref().unwrap().1)
+        }
+
+        fn validate(&self) -> Result<()> {
+            if let Some((_, input)) = &self.current {
+                input.validate()?;
+            }
+            Ok(())
+        }
     }
 
     fn open_input(entry: &FileEntry, allow_direct: bool) -> Result<Input> {
@@ -255,16 +402,19 @@ mod linux {
         let batch_bytes = batch_pieces * piece_length;
         let mut total = 0_u64;
         let mut ends = Vec::with_capacity(files.len());
-        let inputs = files
-            .iter()
-            .map(|entry| {
-                total = total
-                    .checked_add(entry.length)
-                    .context("total length overflow")?;
-                ends.push(total);
-                open_input(entry, allow_direct)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut direct_files = 0;
+        for entry in files {
+            total = total
+                .checked_add(entry.length)
+                .context("total length overflow")?;
+            ends.push(total);
+            // Validate empty files as well, without retaining directory-sized
+            // descriptor tables. Workers reopen only their current input.
+            open_input(entry, false)?;
+            if allow_direct && !entry.padding && entry.length >= DIRECT_MIN as u64 {
+                direct_files += 1;
+            }
+        }
         if total == 0 {
             return Ok(Vec::new());
         }
@@ -272,12 +422,10 @@ mod linux {
             usize::try_from(total.div_ceil(batch_bytes as u64)).context("batch count overflow")?;
         let count =
             usize::try_from(total.div_ceil(piece_length as u64)).context("piece count overflow")?;
-        let buffer_bytes = batch_bytes
-            .min(usize::try_from(total).unwrap_or(usize::MAX))
-            .checked_add(2 * ALIGN - 1)
-            .context("buffer length overflow")?
-            / ALIGN
-            * ALIGN;
+        let buffer_bytes = buffer_length(
+            batch_bytes.min(usize::try_from(total).unwrap_or(usize::MAX)),
+            direct_files,
+        )?;
         let workers = workers.min(batches);
         workers
             .checked_mul(buffer_bytes)
@@ -301,6 +449,9 @@ mod linux {
                 .try_for_each(|_| -> Result<()> {
                     let result = (|| {
                         let mut buffer = AlignedBuffer::new(buffer_bytes)?;
+                        let mut inputs = InputCache::default();
+                        let mut segments = Vec::new();
+                        let mut scratch = Vec::new();
                         loop {
                             if failed.load(Ordering::Relaxed) {
                                 break;
@@ -314,56 +465,68 @@ mod linux {
                                 .context("batch offset overflow")?;
                             let used = (total - begin).min(batch_bytes as u64) as usize;
                             let stop = begin + used as u64;
-                            let index = ends.partition_point(|&end| end <= begin);
-                            let previous = if index == 0 { 0 } else { ends[index - 1] };
                             let bytes = buffer.bytes();
-                            let mut prefix = 0;
-                            let mut done = false;
-                            let input = &inputs[index];
-                            if stop <= ends[index]
-                                && input.regular.is_some()
-                                && !input.direct_disabled.load(Ordering::Relaxed)
-                                && let Some(direct) = &input.direct
-                            {
-                                let offset = begin - previous;
-                                let lead = offset as usize % ALIGN;
-                                let requested = (lead + used).div_ceil(ALIGN) * ALIGN;
-                                let aligned_offset = offset - lead as u64;
-                                match read_at(direct, &mut bytes[..requested], aligned_offset) {
-                                    Ok(read) if read >= lead + used => {
-                                        prefix = lead;
-                                        done = true;
+                            segments.clear();
+                            let mut position = begin;
+                            let mut physical_cursor = 0_usize;
+                            while position < stop {
+                                let index = ends.partition_point(|&end| end <= position);
+                                let previous = if index == 0 { 0 } else { ends[index - 1] };
+                                let length = (ends[index].min(stop) - position) as usize;
+                                let input = inputs.get(index, files, allow_direct)?;
+                                let mut physical_start = physical_cursor;
+                                if let Some(regular) = &input.regular {
+                                    let offset = position - previous;
+                                    let mut direct_done = false;
+                                    if length >= DIRECT_MIN
+                                        && !input.direct_disabled.load(Ordering::Relaxed)
+                                        && let Some(direct) = &input.direct
+                                    {
+                                        let aligned_start = physical_cursor.div_ceil(ALIGN) * ALIGN;
+                                        let lead = offset as usize % ALIGN;
+                                        let requested = (lead + length).div_ceil(ALIGN) * ALIGN;
+                                        let aligned_offset = offset - lead as u64;
+                                        match read_at(
+                                            direct,
+                                            &mut bytes[aligned_start..aligned_start + requested],
+                                            aligned_offset,
+                                        ) {
+                                            Ok(read) if read >= lead + length => {
+                                                physical_start = aligned_start + lead;
+                                                direct_done = true;
+                                            }
+                                            Ok(_) => {}
+                                            Err(error) if unsupported(&error) => {
+                                                input
+                                                    .direct_disabled
+                                                    .store(true, Ordering::Relaxed);
+                                            }
+                                            Err(error) => return Err(error).context("direct read"),
+                                        }
                                     }
-                                    Ok(_) => {
-                                        // A legal short transfer need not be EOF. Retry
-                                        // the required range through the regular descriptor.
+                                    if !direct_done {
+                                        read_exact_at(
+                                            regular,
+                                            &mut bytes[physical_start..physical_start + length],
+                                            offset,
+                                        )?;
                                     }
-                                    Err(error) if unsupported(&error) => {
-                                        input.direct_disabled.store(true, Ordering::Relaxed);
-                                    }
-                                    Err(error) => return Err(error).context("direct read"),
+                                } else {
+                                    bytes[physical_start..physical_start + length].fill(0);
                                 }
+                                push_segment(
+                                    &mut segments,
+                                    Segment {
+                                        logical_start: (position - begin) as usize,
+                                        physical_start,
+                                        length,
+                                    },
+                                );
+                                physical_cursor = physical_start + length;
+                                position += length as u64;
                             }
-                            if !done {
-                                let mut position = begin;
-                                let mut destination = 0;
-                                while position < stop {
-                                    let index = ends.partition_point(|&end| end <= position);
-                                    let previous = if index == 0 { 0 } else { ends[index - 1] };
-                                    let length = (ends[index].min(stop) - position) as usize;
-                                    let target = &mut bytes[destination..destination + length];
-                                    if let Some(regular) = &inputs[index].regular {
-                                        read_exact_at(regular, target, position - previous)?;
-                                    } else {
-                                        target.fill(0);
-                                    }
-                                    position += length as u64;
-                                    destination += length;
-                                }
-                            }
-                            let pieces: Vec<_> =
-                                bytes[prefix..prefix + used].chunks(piece_length).collect();
-                            let hashes = sha1::hash_many(&pieces);
+                            let hashes =
+                                hash_segments(bytes, &segments, used, piece_length, &mut scratch);
                             let first = batch * batch_pieces;
                             let mut result = shared
                                 .lock()
@@ -379,6 +542,7 @@ mod linux {
                                 }
                             }
                         }
+                        inputs.validate()?;
                         Ok(())
                     })();
                     if result.is_err() {
@@ -387,13 +551,8 @@ mod linux {
                     result
                 })
         })?;
-        for input in &inputs {
-            if let Some(file) = &input.regular {
-                ensure!(
-                    file.metadata()?.len() == input.length,
-                    "input length changed while hashing"
-                );
-            }
+        for entry in files {
+            open_input(entry, false)?;
         }
         shared
             .into_inner()
@@ -403,6 +562,7 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use ::sha1::Digest;
         use std::fs;
 
         #[test]
@@ -433,6 +593,127 @@ mod linux {
             let mut buffer = AlignedBuffer::new(8192).unwrap();
             assert_eq!(buffer.bytes().as_ptr() as usize % ALIGN, 0);
             assert!(buffer.bytes().iter().all(|&byte| byte == 0));
+        }
+
+        #[test]
+        fn scattered_segments_preserve_pieces_crossing_multiple_gaps() {
+            let mut buffer = vec![0xa5; 3 * ALIGN];
+            let mut stream = Vec::new();
+            let mut segments = Vec::new();
+            for (physical_start, length) in [(0, 17), (ALIGN, 53), (2 * ALIGN, 101)] {
+                let logical_start = stream.len();
+                let bytes: Vec<_> = (0..length)
+                    .map(|offset| ((logical_start + offset) * 31) as u8)
+                    .collect();
+                buffer[physical_start..physical_start + length].copy_from_slice(&bytes);
+                stream.extend_from_slice(&bytes);
+                push_segment(
+                    &mut segments,
+                    Segment {
+                        logical_start,
+                        physical_start,
+                        length,
+                    },
+                );
+            }
+            for byte in 0..13 {
+                buffer[2 * ALIGN + 101 + byte] = byte as u8;
+                push_segment(
+                    &mut segments,
+                    Segment {
+                        logical_start: stream.len(),
+                        physical_start: 2 * ALIGN + 101 + byte,
+                        length: 1,
+                    },
+                );
+                stream.push(byte as u8);
+            }
+            assert_eq!(segments.len(), 3);
+            assert_eq!(segments[2].length, 114);
+            let mut scratch = Vec::new();
+            for piece in [1, 7, 55, 64, 128, 256] {
+                let expected: Vec<[u8; 20]> = stream
+                    .chunks(piece)
+                    .map(|bytes| ::sha1::Sha1::digest(bytes).into())
+                    .collect();
+                assert_eq!(
+                    hash_segments(&buffer, &segments, stream.len(), piece, &mut scratch),
+                    expected
+                );
+                let short = &stream[..stream.len() - 3];
+                let expected: Vec<[u8; 20]> = short
+                    .chunks(piece)
+                    .map(|bytes| ::sha1::Sha1::digest(bytes).into())
+                    .collect();
+                assert_eq!(
+                    hash_segments(&buffer, &segments, short.len(), piece, &mut scratch),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn alignment_slack_is_bounded_and_rejects_overflow() {
+            for length in [
+                1,
+                ALIGN - 1,
+                DIRECT_MIN - 1,
+                DIRECT_MIN,
+                DIRECT_MIN + 1,
+                17 * DIRECT_MIN + 4095,
+            ] {
+                let allocated = buffer_length(length, usize::MAX).unwrap();
+                assert_eq!(allocated % ALIGN, 0);
+                assert!(allocated >= length + 2 * ALIGN);
+                assert!(allocated - length < length / 8 + 3 * ALIGN);
+            }
+            assert_eq!(
+                buffer_length(16 * DIRECT_MIN, 0).unwrap(),
+                16 * DIRECT_MIN + 2 * ALIGN
+            );
+            assert_eq!(
+                buffer_length(16 * DIRECT_MIN, 1).unwrap(),
+                16 * DIRECT_MIN + 4 * ALIGN
+            );
+            assert!(buffer_length(usize::MAX, usize::MAX).is_err());
+        }
+
+        #[test]
+        fn direct_fragment_thresholds_preserve_discontiguous_piece_data() {
+            let temp = tempfile::tempdir().unwrap();
+            let mut entries = Vec::new();
+            let mut stream = Vec::new();
+            for index in 0..9 {
+                let length = [DIRECT_MIN - 1, DIRECT_MIN, DIRECT_MIN + 1][index % 3];
+                let data: Vec<_> = (0..length)
+                    .map(|offset| ((offset * 17 + index * 29) % 251) as u8)
+                    .collect();
+                entries.push(entry(temp.path(), &index.to_string(), &data));
+                stream.extend_from_slice(&data);
+                let padding = index + 1;
+                entries.push(FileEntry {
+                    disk_path: temp.path().join("unbacked"),
+                    components: vec![b"pad".to_vec()],
+                    length: padding as u64,
+                    padding: true,
+                });
+                stream.resize(stream.len() + padding, 0);
+            }
+            for piece in [16384, DIRECT_MIN, 4 * DIRECT_MIN] {
+                let expected: Vec<[u8; 20]> = stream
+                    .chunks(piece)
+                    .map(|bytes| ::sha1::Sha1::digest(bytes).into())
+                    .collect();
+                for direct in [false, true] {
+                    for batch in [3 * DIRECT_MIN + 7, 20 * DIRECT_MIN] {
+                        assert_eq!(
+                            hash(&entries, piece, 3, batch, direct).unwrap(),
+                            expected,
+                            "piece={piece}, batch={batch}, direct={direct}"
+                        );
+                    }
+                }
+            }
         }
 
         #[test]
