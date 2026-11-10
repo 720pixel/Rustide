@@ -384,11 +384,25 @@ fn selected_document(
     metadata::from_value(document.value)
 }
 
+/// Rust starts with SIGPIPE ignored, so a closed output pipe makes `println!`
+/// panic. Command-line output follows the usual Unix behavior instead: when a
+/// reader such as `head` exits early, Rustide ends quietly. The desktop
+/// interface keeps the Rust default so a lost display connection is reported.
+fn end_quietly_on_closed_pipe() {
+    #[cfg(unix)]
+    // SAFETY: SIG_DFL installs no handler; this only restores the default
+    // disposition for SIGPIPE.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     #[cfg(feature = "gui")]
     if matches!(&cli.command, Some(Command::Gui)) {
         return open_gui();
     }
+    end_quietly_on_closed_pipe();
     if cli.checksum_algorithms {
         println!("sha1\nsha256\nsha512\nmd5");
         return Ok(());

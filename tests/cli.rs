@@ -962,3 +962,53 @@ fn dry_run_and_scan_failure_do_not_claim_creation_completed() {
     }
     assert!(!destination.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn closed_stdout_ends_quietly_for_each_command() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (dir, config, input) = setup();
+    let torrent = dir.path().join("out.torrent");
+    let (input, torrent) = (input.to_str().unwrap(), torrent.to_str().unwrap());
+    success(run(&config, &["create", input, torrent]));
+    let folder = dir.path().to_str().unwrap();
+    let commands: [&[&str]; 14] = [
+        &["info", torrent],
+        &["info", torrent, "--json"],
+        &["show", "name", torrent],
+        &["show", "infohash", torrent],
+        &["show", "files", torrent],
+        &["show", "size", torrent],
+        &["magnet", torrent],
+        &["verify", torrent, input],
+        &["verify", torrent, input, "--json"],
+        &["system", folder],
+        &["create", input, "--stdout"],
+        &["edit", torrent, "--stdout", "--comment", "piped"],
+        &["--checksum-algorithms"],
+        &["--version"],
+    ];
+    for args in commands {
+        let (reader, writer) = std::io::pipe().unwrap();
+        // With the read end closed before launch, the first write meets a closed pipe.
+        drop(reader);
+        let output = command()
+            .args(args)
+            .arg("--config")
+            .arg(&config)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() || output.status.signal() == Some(libc::SIGPIPE),
+            "{args:?} exited with {:?}\n{stderr}",
+            output.status
+        );
+        assert!(
+            !stderr.contains("panicked") && !stderr.contains("Broken pipe"),
+            "{args:?}: {stderr}"
+        );
+    }
+}
