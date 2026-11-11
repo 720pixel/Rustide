@@ -89,8 +89,13 @@ fn direct_creation_overwrite_and_payload_protection() {
     let args = [input.to_str().unwrap(), output.to_str().unwrap()];
     success(run(&config, &args));
     let first = fs::read(&output).unwrap();
-    assert!(!run(&config, &args).status.success());
+    assert!(
+        !run(&config, &[args[0], args[1], "--no-overwrite"])
+            .status
+            .success()
+    );
     assert_eq!(fs::read(&output).unwrap(), first);
+    success(run(&config, &args));
     success(run(&config, &[args[0], args[1], "--force"]));
     assert!(
         !run(&config, &[args[0], args[0], "--force"])

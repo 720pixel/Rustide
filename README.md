@@ -87,7 +87,7 @@ Other creation options include:
 - Related-torrent hashes and collection tags.
 - `--dry-run`, JSON statistics, binary output to stdout, and explicit overwrite control.
 
-Run `rustide create --help` for the full option list. Existing output files require `--force`.
+Run `rustide create --help` for the full option list. Existing output files are overwritten by default; pass `--no-overwrite` to refuse.
 
 ## Inspect and edit
 

@@ -133,8 +133,12 @@ struct CreateArgs {
     cross_seed: bool,
     #[arg(long)]
     no_cross_seed: bool,
+    /// Accepted for compatibility; `create` overwrites existing output by default.
     #[arg(long, alias = "overwrite")]
     force: bool,
+    /// Refuse to replace an existing output file.
+    #[arg(long, conflicts_with = "force")]
+    no_overwrite: bool,
     #[arg(long)]
     stdout: bool,
     #[arg(long)]
@@ -428,8 +432,8 @@ fn run(cli: Cli) -> Result<()> {
                 ))
             });
             ensure!(
-                !output.exists() || args.force || args.stdout || args.dry_run,
-                "output exists: {} (use --force)",
+                !output.exists() || !args.no_overwrite || args.stdout || args.dry_run,
+                "output exists: {} (--no-overwrite is set)",
                 output.display()
             );
             if output.exists() {
@@ -511,7 +515,7 @@ fn run(cli: Cli) -> Result<()> {
             if args.stdout {
                 binary_stdout(&result.value)?;
             } else {
-                metadata::write_atomic(&output, &result.value, args.force)?;
+                metadata::write_atomic(&output, &result.value, !args.no_overwrite)?;
             }
             drop(progress);
             result.report.total_seconds = started.elapsed().as_secs_f64();
